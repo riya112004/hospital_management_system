@@ -1,0 +1,685 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Record and preview audio for a clinical note."
+    />
+    <title>Clinical Note Recorder</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        color: #172b3a;
+        background: #f3f7f8;
+        font-synthesis: none;
+        text-rendering: optimizeLegibility;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        min-width: 320px;
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        padding: 32px 16px;
+        background:
+          radial-gradient(ellipse at 10% 0%, #e1f3f0 0, transparent 38%),
+          #f3f7f8;
+      }
+
+      main {
+        width: min(100%, 560px);
+      }
+
+      .eyebrow {
+        margin: 0 0 8px;
+        color: #167c72;
+        font-size: 0.75rem;
+        font-weight: 750;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(1.75rem, 5vw, 2.25rem);
+        letter-spacing: -0.045em;
+      }
+
+      .intro {
+        margin: 9px 0 24px;
+        color: #60717e;
+        line-height: 1.55;
+      }
+
+      .recorder-card {
+        padding: clamp(22px, 6vw, 34px);
+        border: 1px solid #e1e9eb;
+        border-radius: 22px;
+        background: #fff;
+        box-shadow: 0 18px 50px rgb(34 67 79 / 9%);
+      }
+
+      .timer {
+        margin: 0;
+        color: #102b38;
+        font-size: clamp(3.5rem, 15vw, 5rem);
+        font-variant-numeric: tabular-nums;
+        font-weight: 680;
+        letter-spacing: -0.075em;
+        line-height: 1.1;
+        text-align: center;
+      }
+
+      .status {
+        min-height: 24px;
+        margin: 12px 0 26px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 9px;
+        color: #60717e;
+        font-size: 0.95rem;
+      }
+
+      .status-dot {
+        width: 9px;
+        height: 9px;
+        flex: 0 0 auto;
+        border-radius: 50%;
+        background: #93a2a9;
+      }
+
+      .status[data-state="recording"] {
+        color: #b42332;
+      }
+
+      .status[data-state="recording"] .status-dot {
+        background: #d83a4b;
+        box-shadow: 0 0 0 4px #fce8ea;
+        animation: pulse 1.5s ease-in-out infinite;
+      }
+
+      .status[data-state="ready"] {
+        color: #167c55;
+      }
+
+      .status[data-state="ready"] .status-dot {
+        background: #20a36b;
+      }
+
+      .status[data-state="error"] {
+        color: #b42332;
+      }
+
+      .status[data-state="error"] .status-dot {
+        background: #d83a4b;
+      }
+
+      @keyframes pulse {
+        50% {
+          box-shadow: 0 0 0 7px rgb(216 58 75 / 10%);
+        }
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 12px;
+      }
+
+      button {
+        min-height: 48px;
+        padding: 0 20px;
+        border: 0;
+        border-radius: 12px;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+        transition:
+          transform 120ms ease,
+          background-color 120ms ease,
+          box-shadow 120ms ease;
+      }
+
+      button:not(:disabled):active {
+        transform: translateY(1px);
+      }
+
+      button:focus-visible {
+        outline: 3px solid #72c9bf;
+        outline-offset: 3px;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.48;
+      }
+
+      .start-button {
+        color: #fff;
+        background: #147d72;
+        box-shadow: 0 5px 12px rgb(20 125 114 / 18%);
+      }
+
+      .start-button:not(:disabled):hover {
+        background: #106b62;
+      }
+
+      .stop-button {
+        color: #fff;
+        background: #c33b49;
+      }
+
+      .stop-button:not(:disabled):hover {
+        background: #aa2e3b;
+      }
+
+      .preview {
+        margin-top: 20px;
+        padding: 22px;
+        border: 1px solid #e1e9eb;
+        border-radius: 18px;
+        background: #fff;
+      }
+
+      .preview-heading {
+        margin: 0 0 14px;
+        font-size: 1rem;
+      }
+
+      .audio-name {
+        margin: 0 0 12px;
+        color: #334b59;
+        font-size: 0.9rem;
+        font-weight: 650;
+      }
+
+      audio {
+        width: 100%;
+        height: 44px;
+      }
+
+      .transcript-box {
+        width: 100%;
+        min-height: 132px;
+        padding: 12px 14px;
+        border: 1px solid #d5e0e3;
+        border-radius: 12px;
+        color: #334b59;
+        background: #fbfdfd;
+        font: inherit;
+        line-height: 1.55;
+        resize: vertical;
+      }
+
+      .transcript-box:focus-visible {
+        outline: 3px solid #72c9bf;
+        outline-offset: 2px;
+      }
+
+      .preview-placeholder {
+        margin: 0;
+        padding: 14px;
+        border: 1px dashed #cbd8dc;
+        border-radius: 12px;
+        color: #71818a;
+        font-size: 0.9rem;
+        text-align: center;
+      }
+
+      .recordings-heading {
+        margin: 24px 0 12px;
+        font-size: 1rem;
+      }
+
+      .recordings-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .recording-item {
+        width: 100%;
+        min-height: 48px;
+        padding: 10px 14px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        border: 1px solid #e1e9eb;
+        color: #334b59;
+        background: #fff;
+        text-align: left;
+      }
+
+      .recording-item[aria-current="true"] {
+        border-color: #57aa9f;
+        background: #f0f8f6;
+      }
+
+      .recordings-message {
+        margin: 0;
+        color: #71818a;
+        font-size: 0.9rem;
+      }
+
+      .download-button {
+        width: 100%;
+        margin-top: 14px;
+        color: #176f65;
+        background: #e8f5f2;
+      }
+
+      .download-button:not(:disabled):hover {
+        background: #d9efea;
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+          scroll-behavior: auto !important;
+          transition-duration: 0.01ms !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Audio capture</p>
+      <h1>Clinical Note Recorder</h1>
+      <p class="intro">Speak, stop recording, then review the audio and transcript.</p>
+
+      <section class="recorder-card" aria-label="Audio recorder">
+        <p class="timer" id="timer" aria-label="Recording duration">00:00</p>
+        <p class="status" id="status" data-state="ready" role="status" aria-live="polite">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="status-text">Ready to record</span>
+        </p>
+
+        <div class="controls">
+          <button class="start-button" id="start-button" type="button">
+            Start Recording
+          </button>
+          <button class="stop-button" id="stop-button" type="button" disabled>
+            Stop
+          </button>
+        </div>
+      </section>
+
+      <section class="preview" aria-labelledby="preview-heading">
+        <h2 class="preview-heading" id="preview-heading">Recording Preview</h2>
+        <p class="audio-name" id="audio-name" hidden>Recording.webm</p>
+        <audio id="audio-player" controls hidden></audio>
+        <p class="preview-placeholder" id="preview-placeholder">
+          Audio playback will appear here
+        </p>
+        <button class="download-button" id="download-button" type="button" disabled>
+          Download Recording
+        </button>
+        <h2 class="recordings-heading">Transcript</h2>
+        <textarea
+          class="transcript-box"
+          id="transcript-box"
+          aria-label="Speech transcription"
+          placeholder="Your spoken words will appear here after recording stops."
+          readonly
+        ></textarea>
+        <h2 class="recordings-heading">Saved Recordings</h2>
+        <div class="recordings-list" id="recordings-list" aria-live="polite">
+          <p class="recordings-message">Loading recordings...</p>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const startButton = document.querySelector("#start-button");
+      const stopButton = document.querySelector("#stop-button");
+      const downloadButton = document.querySelector("#download-button");
+      const timerElement = document.querySelector("#timer");
+      const statusElement = document.querySelector("#status");
+      const statusText = document.querySelector("#status-text");
+      const audioPlayer = document.querySelector("#audio-player");
+      const audioName = document.querySelector("#audio-name");
+      const previewPlaceholder = document.querySelector("#preview-placeholder");
+      const transcriptBox = document.querySelector("#transcript-box");
+      const recordingsList = document.querySelector("#recordings-list");
+
+      let mediaRecorder;
+      let mediaStream;
+      let recordingChunks = [];
+      let recordingBlob;
+      let audioUrl;
+      let selectedDownloadUrl;
+      let selectedRecordingId;
+      let startedAt;
+      let timerInterval;
+
+      function setStatus(message, state) {
+        statusText.textContent = message;
+        statusElement.dataset.state = state;
+      }
+
+      function updateTimer() {
+        const elapsedSeconds = Math.floor((Date.now() - startedAt) / 1000);
+        const minutes = Math.floor(elapsedSeconds / 60);
+        const seconds = elapsedSeconds % 60;
+        timerElement.textContent =
+          `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+      }
+
+      function stopTracks() {
+        if (mediaStream) {
+          mediaStream.getTracks().forEach((track) => track.stop());
+          mediaStream = undefined;
+        }
+      }
+
+      function clearPreviousRecording() {
+        if (audioUrl) {
+          URL.revokeObjectURL(audioUrl);
+          audioUrl = undefined;
+        }
+        recordingBlob = undefined;
+        selectedDownloadUrl = undefined;
+        selectedRecordingId = undefined;
+        audioPlayer.removeAttribute("src");
+        audioPlayer.hidden = true;
+        audioName.hidden = true;
+        previewPlaceholder.hidden = false;
+        transcriptBox.value = "";
+        downloadButton.disabled = true;
+      }
+
+      function getFileExtension(mimeType) {
+        if (mimeType.includes("ogg")) return "ogg";
+        if (mimeType.includes("mp4")) return "m4a";
+        return "webm";
+      }
+
+      function formatTimestamp(value) {
+        return new Date(value).toLocaleString();
+      }
+
+      function setPreview(audioSource, title, downloadUrl) {
+        audioPlayer.src = audioSource;
+        audioPlayer.hidden = false;
+        audioName.textContent = title;
+        audioName.hidden = false;
+        previewPlaceholder.hidden = true;
+        selectedDownloadUrl = downloadUrl;
+        downloadButton.disabled = false;
+      }
+
+      function renderRecordings(recordings) {
+        recordingsList.replaceChildren();
+
+        if (recordings.length === 0) {
+          const message = document.createElement("p");
+          message.className = "recordings-message";
+          message.textContent = "No saved recordings yet.";
+          recordingsList.append(message);
+          return;
+        }
+
+        for (const recording of recordings) {
+          const item = document.createElement("button");
+          item.className = "recording-item";
+          item.type = "button";
+          item.setAttribute("aria-current", String(recording.id === selectedRecordingId));
+
+          const timestamp = document.createElement("span");
+          timestamp.textContent = formatTimestamp(recording.created_at);
+          const action = document.createElement("span");
+          action.textContent = "Play";
+          item.append(timestamp, action);
+          item.addEventListener("click", () => {
+            if (audioUrl) {
+              URL.revokeObjectURL(audioUrl);
+              audioUrl = undefined;
+            }
+            recordingBlob = undefined;
+            selectedRecordingId = recording.id;
+            setPreview(
+              recording.audio_url,
+              formatTimestamp(recording.created_at),
+              recording.download_url,
+            );
+            transcriptBox.value =
+              recording.transcript || "No transcript saved for this recording.";
+            setStatus("Playing a saved recording", "ready");
+            renderRecordings(recordings);
+          });
+          recordingsList.append(item);
+        }
+      }
+
+      async function loadRecordings() {
+        const response = await fetch("/api/recordings");
+        if (!response.ok) throw new Error("Could not load saved recordings.");
+        const recordings = await response.json();
+        renderRecordings(recordings);
+        return recordings;
+      }
+
+      async function responseError(response) {
+        const responseBody = await response.text();
+        try {
+          const problem = JSON.parse(responseBody);
+          if (problem.detail) return problem.detail;
+        } catch {
+          return `Server returned HTTP ${response.status}. Check the Uvicorn terminal for details.`;
+        }
+        return `Server returned HTTP ${response.status}. Check the Uvicorn terminal for details.`;
+      }
+
+      async function transcribeRecording(recordingId) {
+        transcriptBox.value = "Loading speech model and transcribing...";
+        setStatus("Recording saved. Transcribing speech...", "ready");
+
+        const response = await fetch(`/api/recordings/${recordingId}/transcribe`, {
+          method: "POST",
+        });
+        if (!response.ok) throw new Error(await responseError(response));
+
+        const result = await response.json();
+        transcriptBox.value = result.text || "No speech detected.";
+        try {
+          await loadRecordings();
+        } catch (error) {
+          setStatus(
+            `Transcription ready, but the saved list could not refresh: ${error.message}`,
+            "error",
+          );
+          return;
+        }
+        setStatus(
+          result.text ? "Transcription complete" : "No speech detected",
+          "ready",
+        );
+      }
+
+      async function saveRecording(blob, durationSeconds) {
+        const extension = getFileExtension(blob.type);
+        const formData = new FormData();
+        formData.append(
+          "file",
+          new File([blob], `recording.${extension}`, {
+            type: blob.type || "audio/webm",
+          }),
+        );
+        formData.append("duration_seconds", String(durationSeconds));
+
+        const response = await fetch("/api/recordings", {
+          method: "POST",
+          body: formData,
+        });
+        if (!response.ok) {
+          throw new Error(await responseError(response));
+        }
+
+        const recording = await response.json();
+        selectedRecordingId = recording.id;
+        if (audioUrl) URL.revokeObjectURL(audioUrl);
+        audioUrl = undefined;
+        setPreview(
+          recording.audio_url,
+          formatTimestamp(recording.created_at),
+          recording.download_url,
+        );
+        try {
+          await loadRecordings();
+        } catch (error) {
+          setStatus(
+            `Recording saved, but the saved list could not refresh: ${error.message}`,
+            "error",
+          );
+        }
+        try {
+          await transcribeRecording(recording.id);
+        } catch (error) {
+          transcriptBox.value = "Transcription failed. The audio recording is saved.";
+          setStatus(
+            `Recording saved, but transcription failed: ${error.message}`,
+            "error",
+          );
+        }
+      }
+
+      startButton.addEventListener("click", async () => {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          setStatus("Microphone recording requires a supported browser on localhost or HTTPS.", "error");
+          return;
+        }
+        if (typeof MediaRecorder === "undefined") {
+          setStatus("Audio recording is not supported by this browser.", "error");
+          return;
+        }
+
+        startButton.disabled = true;
+        setStatus("Requesting microphone access...", "ready");
+
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const preferredType = [
+            "audio/webm;codecs=opus",
+            "audio/webm",
+            "audio/ogg;codecs=opus",
+            "audio/mp4",
+          ].find((type) => MediaRecorder.isTypeSupported(type));
+
+          mediaRecorder = preferredType
+            ? new MediaRecorder(mediaStream, { mimeType: preferredType })
+            : new MediaRecorder(mediaStream);
+
+          clearPreviousRecording();
+          recordingChunks = [];
+          mediaRecorder.addEventListener("dataavailable", (event) => {
+            if (event.data.size > 0) recordingChunks.push(event.data);
+          });
+          mediaRecorder.addEventListener("error", () => {
+            clearInterval(timerInterval);
+            stopTracks();
+            stopButton.disabled = true;
+            startButton.disabled = false;
+            setStatus("Recording failed. Please try again.", "error");
+          });
+          mediaRecorder.addEventListener("stop", async () => {
+            clearInterval(timerInterval);
+            stopTracks();
+            stopButton.disabled = true;
+
+            recordingBlob = new Blob(recordingChunks, {
+              type: mediaRecorder.mimeType || "audio/webm",
+            });
+            if (recordingBlob.size === 0) {
+              setStatus("No audio was captured. Please try again.", "error");
+              return;
+            }
+
+            const extension = getFileExtension(recordingBlob.type);
+            audioUrl = URL.createObjectURL(recordingBlob);
+            selectedRecordingId = undefined;
+            setPreview(audioUrl, `Recording.${extension}`, audioUrl);
+            startButton.disabled = true;
+            setStatus("Saving recording...", "ready");
+            try {
+              const durationSeconds = Math.floor((Date.now() - startedAt) / 1000);
+              await saveRecording(recordingBlob, durationSeconds);
+            } catch (error) {
+              setStatus(
+                `Save failed: ${error.message} The audio is only available in this browser session.`,
+                "error",
+              );
+            } finally {
+              startButton.disabled = false;
+            }
+          });
+
+          mediaRecorder.start();
+          startedAt = Date.now();
+          timerElement.textContent = "00:00";
+          timerInterval = setInterval(updateTimer, 250);
+          stopButton.disabled = false;
+          setStatus("Recording...", "recording");
+        } catch (error) {
+          stopTracks();
+          startButton.disabled = false;
+          const message =
+            error.name === "NotAllowedError"
+              ? "Microphone access was denied. Allow microphone access and try again."
+              : error.name === "NotFoundError"
+                ? "No microphone was found."
+                : "Could not start recording. Check your microphone and try again.";
+          setStatus(message, "error");
+        }
+      });
+
+      stopButton.addEventListener("click", () => {
+        if (mediaRecorder?.state === "recording") {
+          stopButton.disabled = true;
+          setStatus("Preparing your recording...", "ready");
+          mediaRecorder.stop();
+          updateTimer();
+        }
+      });
+
+      downloadButton.addEventListener("click", () => {
+        if (!selectedDownloadUrl) return;
+        const link = document.createElement("a");
+        link.href = selectedDownloadUrl;
+        if (recordingBlob && selectedDownloadUrl === audioUrl) {
+          link.download = `recording.${getFileExtension(recordingBlob.type)}`;
+        }
+        document.body.append(link);
+        link.click();
+        link.remove();
+      });
+
+      loadRecordings().catch(() => {
+        const message = document.createElement("p");
+        message.className = "recordings-message";
+        message.textContent = "Could not load saved recordings. Refresh to try again.";
+        recordingsList.replaceChildren(message);
+      });
+
+      window.addEventListener("beforeunload", () => {
+        clearInterval(timerInterval);
+        stopTracks();
+        if (audioUrl) URL.revokeObjectURL(audioUrl);
+      });
+    </script>
+  </body>
+</html>
