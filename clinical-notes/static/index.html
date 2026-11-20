@@ -138,6 +138,36 @@
         gap: 12px;
       }
 
+      .language-control {
+        display: grid;
+        gap: 7px;
+        width: min(100%, 320px);
+        margin: 0 auto 18px;
+        color: #425765;
+        font-size: 0.9rem;
+        font-weight: 650;
+      }
+
+      .language-control select {
+        min-height: 44px;
+        padding: 8px 12px;
+        border: 1px solid #cbd9dc;
+        border-radius: 10px;
+        color: #172b3a;
+        background: #fff;
+        font: inherit;
+      }
+
+      .language-control select:focus-visible {
+        outline: 3px solid #72c9bf;
+        outline-offset: 3px;
+      }
+
+      .language-control select:disabled {
+        cursor: not-allowed;
+        opacity: 0.6;
+      }
+
       button {
         min-height: 48px;
         padding: 0 20px;
@@ -300,7 +330,7 @@
     <main>
       <p class="eyebrow">Audio capture</p>
       <h1>Clinical Note Recorder</h1>
-      <p class="intro">Speak, stop recording, then review the audio and transcript.</p>
+      <p class="intro">Speak and follow the live transcript while your audio is recorded.</p>
 
       <section class="recorder-card" aria-label="Audio recorder">
         <p class="timer" id="timer" aria-label="Recording duration">00:00</p>
@@ -308,6 +338,23 @@
           <span class="status-dot" aria-hidden="true"></span>
           <span id="status-text">Ready to record</span>
         </p>
+
+        <label class="language-control" for="language-select">
+          Transcription language
+          <select id="language-select">
+            <option value="">Automatic</option>
+            <option value="en">English</option>
+            <option value="pt">Portuguese</option>
+            <option value="hi">Hindi</option>
+            <option value="es">Spanish</option>
+            <option value="fr">French</option>
+            <option value="de">German</option>
+            <option value="it">Italian</option>
+            <option value="ar">Arabic</option>
+            <option value="zh">Chinese</option>
+            <option value="ja">Japanese</option>
+          </select>
+        </label>
 
         <div class="controls">
           <button class="start-button" id="start-button" type="button">
@@ -334,7 +381,7 @@
           class="transcript-box"
           id="transcript-box"
           aria-label="Speech transcription"
-          placeholder="Your spoken words will appear here after recording stops."
+          placeholder="Your spoken words will appear here as you speak."
           readonly
         ></textarea>
         <h2 class="recordings-heading">Saved Recordings</h2>
@@ -347,6 +394,7 @@
     <script>
       const startButton = document.querySelector("#start-button");
       const stopButton = document.querySelector("#stop-button");
+      const languageSelect = document.querySelector("#language-select");
       const downloadButton = document.querySelector("#download-button");
       const timerElement = document.querySelector("#timer");
       const statusElement = document.querySelector("#status");
@@ -365,7 +413,22 @@
       let selectedDownloadUrl;
       let selectedRecordingId;
       let startedAt;
+      let recordingDurationSeconds;
       let timerInterval;
+      let liveSocket;
+      let liveClosePromise;
+      let liveFinishPromise;
+      let liveFinishing = false;
+      let liveTranscript = "";
+      let liveLanguage;
+      let recordingLanguage;
+      let audioContext;
+      let liveSource;
+      let audioProcessor;
+      let pendingSamples = [];
+      let liveSampleRate;
+      let liveChunkSeconds;
+      let liveOverlapSeconds;
 
       function setStatus(message, state) {
         statusText.textContent = message;
@@ -400,7 +463,182 @@
         audioName.hidden = true;
         previewPlaceholder.hidden = false;
         transcriptBox.value = "";
+        liveTranscript = "";
+        liveLanguage = undefined;
         downloadButton.disabled = true;
+      }
+
+      function samplesToPcm(samples) {
+        const pcm = new Int16Array(samples.length);
+        for (let index = 0; index < samples.length; index += 1) {
+          const sample = Math.max(-1, Math.min(1, samples[index]));
+          pcm[index] = sample < 0 ? sample * 32768 : sample * 32767;
+        }
+        return pcm.buffer;
+      }
+
+      function sendLiveChunk(samples) {
+        if (liveSocket?.readyState === WebSocket.OPEN && samples.length > 0) {
+          liveSocket.send(samplesToPcm(samples));
+        }
+      }
+
+      function sendPendingLiveWindows() {
+        if (liveChunkSeconds === undefined || liveOverlapSeconds === undefined) {
+          return;
+        }
+        const chunkSize = Math.floor(liveSampleRate * liveChunkSeconds);
+        const overlapSize = Math.floor(liveSampleRate * liveOverlapSeconds);
+        while (pendingSamples.length >= chunkSize) {
+          sendLiveChunk(pendingSamples.slice(0, chunkSize));
+          pendingSamples = pendingSamples.slice(chunkSize - overlapSize);
+        }
+      }
+
+      function captureLiveAudio(event) {
+        const input = event.inputBuffer.getChannelData(0);
+        event.outputBuffer.getChannelData(0).fill(0);
+        pendingSamples.push(...input);
+        sendPendingLiveWindows();
+      }
+
+      function disconnectLiveAudioCapture() {
+        if (audioProcessor) {
+          audioProcessor.removeEventListener("audioprocess", captureLiveAudio);
+          audioProcessor.disconnect();
+          audioProcessor = undefined;
+        }
+        if (liveSource) {
+          liveSource.disconnect();
+          liveSource = undefined;
+        }
+        if (audioContext) {
+          audioContext.close();
+          audioContext = undefined;
+        }
+      }
+
+      async function startLiveTranscription() {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass) throw new Error("Live audio capture is unavailable.");
+
+        audioContext = new AudioContextClass();
+        await audioContext.resume();
+        if (liveFinishing) return;
+        liveSampleRate = audioContext.sampleRate;
+        liveSource = audioContext.createMediaStreamSource(mediaStream);
+        audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+        audioProcessor.addEventListener("audioprocess", captureLiveAudio);
+        liveSource.connect(audioProcessor);
+        audioProcessor.connect(audioContext.destination);
+
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const parameters = new URLSearchParams({
+          sample_rate: String(liveSampleRate),
+        });
+        if (recordingLanguage) parameters.set("language", recordingLanguage);
+        const socketUrl =
+          `${protocol}//${window.location.host}/api/recordings/live?${parameters}`;
+        liveSocket = new WebSocket(socketUrl);
+        liveSocket.binaryType = "arraybuffer";
+        liveClosePromise = new Promise((resolve) => {
+          liveSocket.addEventListener("close", resolve, { once: true });
+        });
+
+        await new Promise((resolve, reject) => {
+          const onReady = (event) => {
+            const message = JSON.parse(event.data);
+            if (message.type === "status" && message.status === "ready") {
+              liveChunkSeconds = message.window_seconds;
+              liveOverlapSeconds = message.overlap_seconds;
+              liveSocket.removeEventListener("message", onReady);
+              resolve();
+            } else if (message.type === "error") {
+              liveSocket.removeEventListener("message", onReady);
+              reject(new Error(message.message || "Live transcription failed."));
+            }
+          };
+          liveSocket.addEventListener("message", onReady);
+          liveSocket.addEventListener(
+            "error",
+            () => reject(new Error("Could not connect to live transcription.")),
+            { once: true },
+          );
+          liveSocket.addEventListener(
+            "close",
+            (event) => reject(new Error(`Live transcription closed (${event.code}).`)),
+            { once: true },
+          );
+        });
+
+        if (liveFinishing) return;
+
+        liveSocket.addEventListener("close", (event) => {
+          if (!liveFinishing && mediaRecorder?.state === "recording") {
+            setStatus(
+              `Live transcription connection closed unexpectedly (code ${event.code}).`,
+              "error",
+            );
+          }
+        });
+        liveSocket.addEventListener("message", (event) => {
+          const message = JSON.parse(event.data);
+          if (message.type !== "transcript") return;
+          liveTranscript = message.text;
+          liveLanguage = message.language;
+          transcriptBox.value = liveTranscript || "Listening...";
+          if (mediaRecorder?.state === "recording") {
+            setStatus("Live transcription active", "recording");
+          }
+        });
+        liveSocket.addEventListener("error", () => liveSocket.close());
+        sendPendingLiveWindows();
+      }
+
+      function finishLiveTranscription() {
+        liveFinishing = true;
+        disconnectLiveAudioCapture();
+        const liveReady =
+          liveChunkSeconds !== undefined &&
+          liveOverlapSeconds !== undefined &&
+          liveSocket?.readyState === WebSocket.OPEN;
+        if (liveReady) {
+          sendPendingLiveWindows();
+        }
+        if (liveReady && pendingSamples.length) {
+          sendLiveChunk(pendingSamples);
+        }
+        pendingSamples = [];
+
+        if (!liveReady) {
+          if (
+            liveSocket?.readyState === WebSocket.CONNECTING ||
+            liveSocket?.readyState === WebSocket.OPEN
+          ) {
+            liveSocket.close();
+          }
+          return liveClosePromise || Promise.resolve();
+        }
+        liveSocket.send(JSON.stringify({ type: "stop" }));
+        return liveClosePromise || Promise.resolve();
+      }
+
+      function handleLiveTranscriptionFailure(error) {
+        disconnectLiveAudioCapture();
+        pendingSamples = [];
+        if (
+          liveSocket?.readyState === WebSocket.CONNECTING ||
+          liveSocket?.readyState === WebSocket.OPEN
+        ) {
+          liveSocket.close();
+        }
+        liveSocket = undefined;
+        if (!liveFinishing && mediaRecorder?.state === "recording") {
+          setStatus(
+            `Live transcription unavailable: ${error.message} Recording will still be saved.`,
+            "recording",
+          );
+        }
       }
 
       function getFileExtension(mimeType) {
@@ -485,33 +723,91 @@
         return `Server returned HTTP ${response.status}. Check the Uvicorn terminal for details.`;
       }
 
-      async function transcribeRecording(recordingId) {
-        transcriptBox.value = "Loading speech model and transcribing...";
-        setStatus("Recording saved. Transcribing speech...", "ready");
+      async function transcribeRecording(recordingId, language) {
+        const isSelected = () => selectedRecordingId === recordingId;
+        if (isSelected() && !transcriptBox.value) {
+          transcriptBox.value = "Loading speech model and transcribing...";
+        }
+        if (isSelected()) setStatus("Finalizing transcript...", "recording");
 
-        const response = await fetch(`/api/recordings/${recordingId}/transcribe`, {
-          method: "POST",
-        });
+        const languageParameter = language
+          ? `?language=${encodeURIComponent(language)}`
+          : "";
+        const response = await fetch(
+          `/api/recordings/${recordingId}/transcribe${languageParameter}`,
+          {
+            method: "POST",
+          },
+        );
         if (!response.ok) throw new Error(await responseError(response));
 
         const result = await response.json();
-        transcriptBox.value = result.text || "No speech detected.";
+        if (isSelected()) {
+          transcriptBox.value = result.text || "No speech detected.";
+        }
         try {
           await loadRecordings();
         } catch (error) {
-          setStatus(
-            `Transcription ready, but the saved list could not refresh: ${error.message}`,
-            "error",
-          );
+          if (isSelected()) {
+            setStatus(
+              `Transcription ready, but the saved list could not refresh: ${error.message}`,
+              "error",
+            );
+          }
           return;
         }
-        setStatus(
-          result.text ? "Transcription complete" : "No speech detected",
-          "ready",
-        );
+        if (isSelected()) {
+          setStatus(
+            result.text ? "Transcription complete" : "No speech detected",
+            "ready",
+          );
+        }
       }
 
-      async function saveRecording(blob, durationSeconds) {
+      function waitForLiveDrain() {
+        if (!liveFinishPromise) return Promise.resolve();
+        let timeoutId;
+        const outcome = Promise.race([
+          liveFinishPromise.then(
+            () => ({ status: "drained" }),
+            (error) => ({ status: "failed", error }),
+          ),
+          new Promise((resolve) => {
+            timeoutId = setTimeout(
+              () => resolve({ status: "timeout" }),
+              4000,
+            );
+          }),
+        ]);
+        return outcome.then((result) => {
+          clearTimeout(timeoutId);
+          if (result.status === "timeout") {
+            if (
+              liveSocket?.readyState === WebSocket.CONNECTING ||
+              liveSocket?.readyState === WebSocket.OPEN
+            ) {
+              liveSocket.close();
+            }
+            setStatus(
+              "Finalizing... Live transcript may be incomplete.",
+              "recording",
+            );
+          } else if (result.status === "failed") {
+            setStatus(
+              `Finalizing... Live transcription drain failed: ${result.error.message}`,
+              "recording",
+            );
+          }
+        });
+      }
+
+      async function saveRecording(
+        blob,
+        durationSeconds,
+        transcript,
+        language,
+        transcriptionLanguage,
+      ) {
         const extension = getFileExtension(blob.type);
         const formData = new FormData();
         formData.append(
@@ -521,6 +817,8 @@
           }),
         );
         formData.append("duration_seconds", String(durationSeconds));
+        if (transcript) formData.append("transcript", transcript);
+        if (language) formData.append("language", language);
 
         const response = await fetch("/api/recordings", {
           method: "POST",
@@ -547,15 +845,24 @@
             "error",
           );
         }
-        try {
-          await transcribeRecording(recording.id);
-        } catch (error) {
-          transcriptBox.value = "Transcription failed. The audio recording is saved.";
-          setStatus(
-            `Recording saved, but transcription failed: ${error.message}`,
-            "error",
-          );
-        }
+        transcriptBox.value = transcript || "";
+        setStatus("Recording saved. Finalizing transcript in the background...", "recording");
+        void transcribeRecording(recording.id, transcriptionLanguage).catch((error) => {
+          if (selectedRecordingId !== recording.id) return;
+          if (transcript) {
+            transcriptBox.value = transcript;
+            setStatus(
+              `Recording and live transcript saved, but final transcription failed: ${error.message}`,
+              "error",
+            );
+          } else {
+            transcriptBox.value = "Transcription failed. The audio recording is saved.";
+            setStatus(
+              `Recording saved, but transcription failed: ${error.message}`,
+              "error",
+            );
+          }
+        });
       }
 
       startButton.addEventListener("click", async () => {
@@ -569,7 +876,9 @@
         }
 
         startButton.disabled = true;
+        languageSelect.disabled = true;
         setStatus("Requesting microphone access...", "ready");
+        const selectedLanguage = languageSelect.value || undefined;
 
         try {
           mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -586,26 +895,40 @@
 
           clearPreviousRecording();
           recordingChunks = [];
+          pendingSamples = [];
+          recordingDurationSeconds = undefined;
+          liveFinishPromise = undefined;
+          liveFinishing = false;
+          liveSocket = undefined;
+          liveClosePromise = undefined;
+          liveChunkSeconds = undefined;
+          liveOverlapSeconds = undefined;
+          recordingLanguage = selectedLanguage;
           mediaRecorder.addEventListener("dataavailable", (event) => {
             if (event.data.size > 0) recordingChunks.push(event.data);
           });
           mediaRecorder.addEventListener("error", () => {
             clearInterval(timerInterval);
+            finishLiveTranscription();
             stopTracks();
             stopButton.disabled = true;
             startButton.disabled = false;
+            languageSelect.disabled = false;
             setStatus("Recording failed. Please try again.", "error");
           });
           mediaRecorder.addEventListener("stop", async () => {
             clearInterval(timerInterval);
             stopTracks();
             stopButton.disabled = true;
+            await waitForLiveDrain();
 
             recordingBlob = new Blob(recordingChunks, {
               type: mediaRecorder.mimeType || "audio/webm",
             });
             if (recordingBlob.size === 0) {
               setStatus("No audio was captured. Please try again.", "error");
+              startButton.disabled = false;
+              languageSelect.disabled = false;
               return;
             }
 
@@ -616,8 +939,14 @@
             startButton.disabled = true;
             setStatus("Saving recording...", "ready");
             try {
-              const durationSeconds = Math.floor((Date.now() - startedAt) / 1000);
-              await saveRecording(recordingBlob, durationSeconds);
+              await saveRecording(
+                recordingBlob,
+                recordingDurationSeconds ??
+                  Math.floor((Date.now() - startedAt) / 1000),
+                liveTranscript,
+                liveLanguage,
+                recordingLanguage,
+              );
             } catch (error) {
               setStatus(
                 `Save failed: ${error.message} The audio is only available in this browser session.`,
@@ -625,18 +954,21 @@
               );
             } finally {
               startButton.disabled = false;
+              languageSelect.disabled = false;
             }
           });
 
-          mediaRecorder.start();
+          mediaRecorder.start(1500);
           startedAt = Date.now();
           timerElement.textContent = "00:00";
           timerInterval = setInterval(updateTimer, 250);
           stopButton.disabled = false;
           setStatus("Recording...", "recording");
+          void startLiveTranscription().catch(handleLiveTranscriptionFailure);
         } catch (error) {
           stopTracks();
           startButton.disabled = false;
+          languageSelect.disabled = false;
           const message =
             error.name === "NotAllowedError"
               ? "Microphone access was denied. Allow microphone access and try again."
@@ -649,8 +981,12 @@
 
       stopButton.addEventListener("click", () => {
         if (mediaRecorder?.state === "recording") {
+          recordingDurationSeconds = Math.floor(
+            (Date.now() - startedAt) / 1000,
+          );
           stopButton.disabled = true;
-          setStatus("Preparing your recording...", "ready");
+          setStatus("Finalizing...", "recording");
+          liveFinishPromise = finishLiveTranscription();
           mediaRecorder.stop();
           updateTimer();
         }
