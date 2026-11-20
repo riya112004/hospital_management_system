@@ -1,11 +1,16 @@
 import asyncio
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 import json
+import math
 from pathlib import Path
+import re
 import tempfile
 from threading import Lock
-from typing import Annotated
+from typing import Annotated, AsyncIterator
 from uuid import UUID, uuid4
 import wave
 
@@ -21,7 +26,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from config import (
     ALLOWED_AUDIO_TYPES,
@@ -29,10 +34,13 @@ from config import (
     APP_TITLE,
     CHUNK_SIZE,
     LIVE_CHUNK_SECONDS,
+    LIVE_MEDICAL_PROMPT,
     LIVE_OVERLAP_SECONDS,
+    LIVE_PROMPT_CONTEXT_WORDS,
     LIVE_UNSTABLE_TAIL_SECONDS,
     LIVE_WHISPER_MODEL_SIZE,
     MAX_RECORDING_BYTES,
+    MAX_TRANSCRIPT_LENGTH,
     RECORDINGS_DIR,
     STATIC_DIR,
     TRANSCRIPTION_LANGUAGE_CODES,
@@ -45,10 +53,36 @@ EXTENSION_AUDIO_TYPES = {
     extension: content_type
     for content_type, extension in ALLOWED_AUDIO_TYPES.items()
 }
-TRANSCRIPTION_LOCK = Lock()
+FINAL_TRANSCRIPTION_LOCK = Lock()
+RECORDING_METADATA_LOCK = Lock()
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title=APP_TITLE, description=APP_DESCRIPTION)
+
+def warm_live_model() -> None:
+    get_live_whisper_model()
+    silence = b"\x00\x00" * int(16_000 * LIVE_CHUNK_SECONDS)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                transcribe_pcm_chunk,
+                silence,
+                16_000,
+                None,
+                LIVE_MEDICAL_PROMPT,
+            )
+            for _ in range(2)
+        ]
+        for future in futures:
+            future.result()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    await asyncio.to_thread(warm_live_model)
+    yield
+
+
+app = FastAPI(title=APP_TITLE, description=APP_DESCRIPTION, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -59,6 +93,7 @@ class RecordingOut(BaseModel):
     size_bytes: int
     duration_seconds: float | None
     transcript: str | None
+    transcript_reviewed: bool
     language: str | None
     audio_url: str
     download_url: str
@@ -68,6 +103,11 @@ class TranscriptionOut(BaseModel):
     recording_id: str
     text: str
     language: str | None
+    transcript_reviewed: bool
+
+
+class TranscriptUpdate(BaseModel):
+    transcript: Annotated[str, Field(max_length=MAX_TRANSCRIPT_LENGTH)]
 
 
 def metadata_path(recording_id: str) -> Path:
@@ -111,16 +151,35 @@ def get_whisper_model() -> WhisperModel:
 
 @lru_cache(maxsize=1)
 def get_live_whisper_model() -> WhisperModel:
-    return create_whisper_model(LIVE_WHISPER_MODEL_SIZE)
+    return create_whisper_model(LIVE_WHISPER_MODEL_SIZE, num_workers=2)
 
 
-def create_whisper_model(model_size: str) -> WhisperModel:
+def create_whisper_model(model_size: str, *, num_workers: int = 1) -> WhisperModel:
     return WhisperModel(
         model_size,
-        device="cpu",
+        device="auto",
         compute_type="int8",
-        cpu_threads=WHISPER_CPU_THREADS,
+        cpu_threads=max(1, WHISPER_CPU_THREADS // num_workers),
+        num_workers=num_workers,
     )
+
+
+def has_repeated_phrase_loop(text: str) -> bool:
+    words = re.findall(r"\w+", text.casefold())
+    if len(words) < 12:
+        return False
+
+    for phrase_size in range(min(12, len(words) // 2), 5, -1):
+        phrase_counts = Counter(
+            tuple(words[index : index + phrase_size])
+            for index in range(len(words) - phrase_size + 1)
+        )
+        if any(
+            count >= 2 and count * phrase_size >= len(words) * 0.4
+            for count in phrase_counts.values()
+        ):
+            return True
+    return False
 
 
 def transcribe_audio_file(
@@ -129,12 +188,15 @@ def transcribe_audio_file(
     language: str | None = None,
     vad_filter: bool = True,
 ) -> tuple[str, str | None]:
-    with TRANSCRIPTION_LOCK:
+    with FINAL_TRANSCRIPTION_LOCK:
         model = get_whisper_model()
         segments, info = model.transcribe(
             str(audio_path),
             language=language,
             vad_filter=vad_filter,
+            condition_on_previous_text=False,
+            word_timestamps=True,
+            hallucination_silence_threshold=2,
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
     return text, info.language
@@ -143,24 +205,25 @@ def transcribe_audio_file(
 def transcribe_live_audio_file(
     audio_path: Path,
     language: str | None = None,
+    initial_prompt: str | None = None,
 ) -> tuple[str, str | None, list[tuple[float, float, str]]]:
-    with TRANSCRIPTION_LOCK:
-        model = get_live_whisper_model()
-        segments, info = model.transcribe(
-            str(audio_path),
-            language=language,
-            vad_filter=False,
-            word_timestamps=True,
-            beam_size=1,
-        )
-        words: list[tuple[float, float, str]] = []
-        for segment in segments:
-            for word in getattr(segment, "words", None) or []:
-                word_text = (getattr(word, "word", "") or "").strip()
-                if word_text:
-                    words.append(
-                        (float(word.start), float(word.end), word_text),
-                    )
+    model = get_live_whisper_model()
+    segments, info = model.transcribe(
+        str(audio_path),
+        language=language,
+        vad_filter=False,
+        word_timestamps=True,
+        beam_size=1,
+        initial_prompt=initial_prompt or LIVE_MEDICAL_PROMPT,
+    )
+    words: list[tuple[float, float, str]] = []
+    for segment in segments:
+        for word in getattr(segment, "words", None) or []:
+            word_text = (getattr(word, "word", "") or "").strip()
+            if word_text:
+                words.append(
+                    (float(word.start), float(word.end), word_text),
+                )
 
     text = " ".join(word for _, _, word in words)
     return text, info.language, words
@@ -170,6 +233,7 @@ def transcribe_pcm_chunk(
     pcm: bytes,
     sample_rate: int,
     language: str | None = None,
+    initial_prompt: str | None = None,
 ) -> tuple[str, str | None, list[tuple[float, float, str]]]:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_file:
         audio_path = Path(audio_file.name)
@@ -180,9 +244,16 @@ def transcribe_pcm_chunk(
             wav_file.setsampwidth(2)
             wav_file.setframerate(sample_rate)
             wav_file.writeframes(pcm)
-        return transcribe_live_audio_file(audio_path, language)
+        return transcribe_live_audio_file(audio_path, language, initial_prompt)
     finally:
         audio_path.unlink(missing_ok=True)
+
+
+def build_live_initial_prompt(recent_transcript: str) -> str:
+    recent_words = recent_transcript.split()[-LIVE_PROMPT_CONTEXT_WORDS:]
+    if not recent_words:
+        return LIVE_MEDICAL_PROMPT
+    return f"{LIVE_MEDICAL_PROMPT} Recent transcript: {' '.join(recent_words)}"
 
 
 def recording_response(audio_path: Path) -> RecordingOut:
@@ -199,6 +270,7 @@ def recording_response(audio_path: Path) -> RecordingOut:
         size_bytes=audio_path.stat().st_size,
         duration_seconds=details.get("duration_seconds"),
         transcript=details.get("transcript"),
+        transcript_reviewed=bool(details.get("transcript_reviewed", False)),
         language=details.get("language"),
         audio_url=f"/api/recordings/{recording_id}/audio",
         download_url=f"/api/recordings/{recording_id}/download",
@@ -261,6 +333,7 @@ def save_recording(
             "content_type": content_type,
             "duration_seconds": duration_seconds,
             "transcript": transcript,
+            "transcript_reviewed": False,
             "language": language,
         }
         with temporary_metadata.open("w", encoding="utf-8") as details_file:
@@ -289,10 +362,9 @@ async def transcribe_live(
     if not 8000 <= sample_rate <= 96000:
         await websocket.close(code=1008, reason="Unsupported audio sample rate")
         return
-    if language is not None and language not in TRANSCRIPTION_LANGUAGE_CODES:
-        await websocket.close(code=1008, reason="Unsupported transcription language")
-        return
-    requested_language = language or None
+    requested_language = (
+        language if language in TRANSCRIPTION_LANGUAGE_CODES else None
+    )
 
     await websocket.accept()
     await asyncio.to_thread(get_live_whisper_model)
@@ -303,6 +375,7 @@ async def transcribe_live(
                 "status": "ready",
                 "window_seconds": LIVE_CHUNK_SECONDS,
                 "overlap_seconds": LIVE_OVERLAP_SECONDS,
+                "unstable_tail_seconds": LIVE_UNSTABLE_TAIL_SECONDS,
             }
         )
     except WebSocketDisconnect:
@@ -310,9 +383,12 @@ async def transcribe_live(
 
     transcript = ""
     transcript_words: list[str] = []
+    pending_words: list[tuple[float, float, str]] = []
+    pending_word_tolerance = 0.08
     detected_language = requested_language
     chunk_start = 0.0
     last_word_end = 0.0
+    resume_received = False
 
     while True:
         message = await websocket.receive()
@@ -329,8 +405,77 @@ async def transcribe_live(
                 await websocket.close(code=1003, reason="Expected a JSON object")
                 return
             if command.get("type") == "stop":
+                final_words: list[str] = []
+                for absolute_start, absolute_end, word_text in sorted(
+                    pending_words,
+                    key=lambda word: (word[0], word[1]),
+                ):
+                    if absolute_end <= last_word_end + pending_word_tolerance:
+                        continue
+                    if (
+                        absolute_start < last_word_end - pending_word_tolerance
+                        and transcript_words
+                        and transcript_words[-1].casefold() == word_text.casefold()
+                    ):
+                        continue
+                    final_words.append(word_text)
+                    last_word_end = max(last_word_end, absolute_end)
+
+                transcript_words.extend(final_words)
+                transcript = " ".join(transcript_words)
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "transcript",
+                            "text": transcript,
+                            "segment": " ".join(final_words),
+                            "language": detected_language,
+                        }
+                    )
+                except WebSocketDisconnect:
+                    return
                 await websocket.close()
                 return
+            if command.get("type") == "resume" and not resume_received:
+                resume_text = command.get("transcript", "")
+                resume_at = command.get("resume_at_seconds", 0)
+                resume_language = command.get("language")
+                if (
+                    not isinstance(resume_text, str)
+                    or isinstance(resume_at, bool)
+                    or not isinstance(resume_at, (int, float))
+                    or resume_at < 0
+                    or resume_at > 1_000_000_000
+                    or not math.isfinite(resume_at)
+                    or (
+                        resume_language is not None
+                        and not isinstance(resume_language, str)
+                    )
+                ):
+                    await websocket.close(
+                        code=1008,
+                        reason="Invalid live transcription resume state",
+                    )
+                    return
+                transcript_words = resume_text.split()[-LIVE_PROMPT_CONTEXT_WORDS:]
+                transcript = " ".join(transcript_words)
+                pending_words = []
+                chunk_start = float(resume_at)
+                last_word_end = (
+                    max(
+                        0.0,
+                        chunk_start
+                        + LIVE_OVERLAP_SECONDS
+                        - LIVE_UNSTABLE_TAIL_SECONDS,
+                    )
+                    if chunk_start > 0
+                    else 0.0
+                )
+                if resume_language in TRANSCRIPTION_LANGUAGE_CODES:
+                    requested_language = resume_language
+                    detected_language = resume_language
+                resume_received = True
+                continue
             await websocket.close(code=1003, reason="Unsupported command")
             return
 
@@ -347,8 +492,20 @@ async def transcribe_live(
         chunk_start += LIVE_CHUNK_SECONDS - LIVE_OVERLAP_SECONDS
         stable_until = chunk_seconds - LIVE_UNSTABLE_TAIL_SECONDS
         tolerance = min(0.08, chunk_seconds * 0.05)
+        pending_word_tolerance = tolerance
 
         if not any(pcm):
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "transcript",
+                        "text": transcript,
+                        "segment": "",
+                        "language": detected_language,
+                    }
+                )
+            except WebSocketDisconnect:
+                return
             continue
 
         segment, chunk_language, words = await asyncio.to_thread(
@@ -356,16 +513,22 @@ async def transcribe_live(
             pcm,
             sample_rate,
             requested_language,
+            build_live_initial_prompt(transcript),
         )
         if chunk_language:
             detected_language = chunk_language
 
         if words:
             new_words: list[str] = []
+            window_pending_words: list[tuple[float, float, str]] = []
             for word_start, word_end, word_text in words:
                 absolute_start = current_start + word_start
                 absolute_end = current_start + word_end
                 if word_end > stable_until:
+                    if word_end <= chunk_seconds:
+                        window_pending_words.append(
+                            (absolute_start, absolute_end, word_text)
+                        )
                     continue
                 if absolute_end <= last_word_end + tolerance:
                     continue
@@ -380,6 +543,12 @@ async def transcribe_live(
             transcript_words.extend(new_words)
             transcript = " ".join(transcript_words)
             segment = " ".join(new_words)
+            pending_words = [
+                pending_word
+                for pending_word in pending_words
+                if pending_word[1] > last_word_end + tolerance
+            ]
+            pending_words.extend(window_pending_words)
         else:
             segment = ""
 
@@ -408,19 +577,65 @@ def transcribe_recording(
     if language is not None and language not in TRANSCRIPTION_LANGUAGE_CODES:
         raise HTTPException(status_code=422, detail="Unsupported transcription language")
     audio_path = find_recording(recording_id)
+    with RECORDING_METADATA_LOCK:
+        if not audio_path.is_file():
+            raise HTTPException(status_code=404, detail="Recording not found")
+        details = read_recording_metadata(audio_path)
+        if details.get("transcript_reviewed"):
+            return TranscriptionOut(
+                recording_id=str(recording_id),
+                text=details.get("transcript") or "",
+                language=details.get("language"),
+                transcript_reviewed=True,
+            )
+        live_transcript = details.get("transcript") or ""
+        live_language = details.get("language")
+
     transcript, detected_language = transcribe_audio_file(
         audio_path,
         language=language,
     )
-    details = read_recording_metadata(audio_path)
-    details["transcript"] = transcript
-    details["language"] = detected_language
-    write_recording_metadata(str(recording_id), details)
+    if live_transcript and (
+        not transcript.strip() or has_repeated_phrase_loop(transcript)
+    ):
+        transcript = live_transcript
+        detected_language = live_language or detected_language
+
+    with RECORDING_METADATA_LOCK:
+        if not audio_path.is_file():
+            raise HTTPException(status_code=404, detail="Recording not found")
+        details = read_recording_metadata(audio_path)
+        if details.get("transcript_reviewed"):
+            transcript = details.get("transcript") or ""
+            detected_language = details.get("language")
+        else:
+            details["transcript"] = transcript
+            details["language"] = detected_language
+            write_recording_metadata(str(recording_id), details)
     return TranscriptionOut(
         recording_id=str(recording_id),
         text=transcript,
         language=detected_language,
+        transcript_reviewed=bool(details.get("transcript_reviewed", False)),
     )
+
+
+@app.put(
+    "/api/recordings/{recording_id}/transcript",
+    response_model=RecordingOut,
+    summary="Save edits to a recording transcript",
+)
+def update_recording_transcript(
+    recording_id: UUID,
+    update: TranscriptUpdate,
+) -> RecordingOut:
+    with RECORDING_METADATA_LOCK:
+        audio_path = find_recording(recording_id)
+        details = read_recording_metadata(audio_path)
+        details["transcript"] = update.transcript
+        details["transcript_reviewed"] = True
+        write_recording_metadata(str(recording_id), details)
+        return recording_response(audio_path)
 
 
 @app.get(
@@ -440,6 +655,24 @@ def list_recordings() -> list[RecordingOut]:
         recordings.append(recording_response(audio_path))
 
     return sorted(recordings, key=lambda recording: recording.created_at, reverse=True)
+
+
+@app.delete(
+    "/api/recordings/{recording_id}",
+    status_code=204,
+    summary="Delete a saved recording",
+)
+def delete_recording(recording_id: UUID) -> None:
+    with RECORDING_METADATA_LOCK:
+        audio_path = find_recording(recording_id)
+        try:
+            audio_path.unlink()
+            metadata_path(str(recording_id)).unlink(missing_ok=True)
+        except OSError as error:
+            raise HTTPException(
+                status_code=500,
+                detail="Could not delete the recording.",
+            ) from error
 
 
 @app.get(

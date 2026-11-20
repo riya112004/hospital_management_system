@@ -1,6 +1,9 @@
+import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from unittest.mock import patch
 import wave
@@ -25,7 +28,7 @@ class RecordingApiTests(unittest.TestCase):
         main.RECORDINGS_DIR = cls.original_recordings_dir
         cls.temp_dir.cleanup()
 
-    def test_live_and_final_models_use_configured_sizes_and_cpu_threads(self) -> None:
+    def test_live_and_final_models_use_auto_device_and_worker_counts(self) -> None:
         main.get_whisper_model.cache_clear()
         main.get_live_whisper_model.cache_clear()
         try:
@@ -40,12 +43,42 @@ class RecordingApiTests(unittest.TestCase):
             [call.args[0] for call in model_factory.call_args_list],
             [main.WHISPER_MODEL_SIZE, main.LIVE_WHISPER_MODEL_SIZE],
         )
-        self.assertTrue(
-            all(
-                call.kwargs["cpu_threads"] == main.WHISPER_CPU_THREADS
-                for call in model_factory.call_args_list
-            )
+        self.assertEqual(
+            [call.kwargs["cpu_threads"] for call in model_factory.call_args_list],
+            [
+                main.WHISPER_CPU_THREADS,
+                max(1, main.WHISPER_CPU_THREADS // 2),
+            ],
         )
+        self.assertEqual(
+            [call.kwargs["device"] for call in model_factory.call_args_list],
+            ["auto", "auto"],
+        )
+        self.assertEqual(
+            [call.kwargs["num_workers"] for call in model_factory.call_args_list],
+            [1, 2],
+        )
+
+    def test_live_transcription_requests_can_run_concurrently(self) -> None:
+        barrier = Barrier(2)
+
+        class ConcurrentModel:
+            def transcribe(self, *args, **kwargs):
+                barrier.wait(timeout=5)
+                return iter(()), SimpleNamespace(language="en")
+
+        with patch("main.get_live_whisper_model", return_value=ConcurrentModel()):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(
+                    executor.map(
+                        lambda _: main.transcribe_live_audio_file(
+                            Path(self.temp_dir.name) / "sample.wav"
+                        ),
+                        range(2),
+                    )
+                )
+
+        self.assertEqual(results, [("", "en", []), ("", "en", [])])
 
     def test_upload_list_play_and_download(self) -> None:
         audio = b"sample audio bytes"
@@ -97,6 +130,142 @@ class RecordingApiTests(unittest.TestCase):
             "Hello from the recording.",
         )
 
+        def finish_after_review(audio_path, *, language):
+            details = main.read_recording_metadata(audio_path)
+            details["transcript"] = "Reviewed clinical note."
+            details["transcript_reviewed"] = True
+            main.write_recording_metadata(recording["id"], details)
+            return "Generated transcript.", "en"
+
+        with patch(
+            "main.transcribe_audio_file",
+            side_effect=finish_after_review,
+        ) as transcribe_file:
+            reviewed_result = self.client.post(
+                f"/api/recordings/{recording['id']}/transcribe"
+            )
+        transcribe_file.assert_called_once()
+        self.assertEqual(
+            reviewed_result.json()["text"],
+            "Reviewed clinical note.",
+        )
+        self.assertTrue(reviewed_result.json()["transcript_reviewed"])
+
+        edited = self.client.put(
+            f"/api/recordings/{recording['id']}/transcript",
+            json={"transcript": "Edited and reviewed note."},
+        )
+        self.assertEqual(edited.status_code, 200)
+        self.assertEqual(edited.json()["transcript"], "Edited and reviewed note.")
+        self.assertTrue(edited.json()["transcript_reviewed"])
+
+        with patch("main.transcribe_audio_file") as transcribe_file:
+            reviewed_result = self.client.post(
+                f"/api/recordings/{recording['id']}/transcribe"
+            )
+        transcribe_file.assert_not_called()
+        self.assertEqual(
+            reviewed_result.json()["text"],
+            "Edited and reviewed note.",
+        )
+        self.assertEqual(
+            self.client.get("/api/recordings").json()[0]["transcript"],
+            "Edited and reviewed note.",
+        )
+
+        longer_edit = "x" * 734
+        longer_edit_result = self.client.put(
+            f"/api/recordings/{recording['id']}/transcript",
+            json={"transcript": longer_edit},
+        )
+        self.assertEqual(longer_edit_result.status_code, 200)
+        self.assertEqual(longer_edit_result.json()["transcript"], longer_edit)
+
+        maximum_length = "x" * main.MAX_TRANSCRIPT_LENGTH
+        within_limit = self.client.put(
+            f"/api/recordings/{recording['id']}/transcript",
+            json={"transcript": maximum_length},
+        )
+        self.assertEqual(within_limit.status_code, 200)
+        self.assertEqual(
+            len(within_limit.json()["transcript"]),
+            main.MAX_TRANSCRIPT_LENGTH,
+        )
+
+        over_limit = self.client.put(
+            f"/api/recordings/{recording['id']}/transcript",
+            json={"transcript": maximum_length + "x"},
+        )
+        self.assertEqual(over_limit.status_code, 422)
+        self.assertEqual(
+            self.client.get("/api/recordings").json()[0]["transcript"],
+            maximum_length,
+        )
+
+        deleted = self.client.delete(f"/api/recordings/{recording['id']}")
+        self.assertEqual(deleted.status_code, 204)
+        self.assertFalse(saved_path.exists())
+        self.assertFalse(
+            (main.RECORDINGS_DIR / f"{recording['id']}.json").exists()
+        )
+        self.assertEqual(
+            self.client.delete(f"/api/recordings/{recording['id']}").status_code,
+            404,
+        )
+
+    def test_final_transcription_keeps_live_text_when_output_loops(self) -> None:
+        live_transcript = (
+            "The patient reports intermittent chest discomfort without "
+            "shortness of breath."
+        )
+        response = self.client.post(
+            "/api/recordings",
+            files={"file": ("sample.webm", b"sample audio bytes", "audio/webm")},
+            data={"transcript": live_transcript, "language": "en"},
+        )
+        self.assertEqual(response.status_code, 201)
+        recording_id = response.json()["id"]
+        repeated_transcript = (
+            "The title of the story is the title of her. " * 4
+        ).strip()
+
+        with patch(
+            "main.transcribe_audio_file",
+            return_value=(repeated_transcript, "en"),
+        ):
+            result = self.client.post(
+                f"/api/recordings/{recording_id}/transcribe"
+            )
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()["text"], live_transcript)
+        self.assertEqual(
+            self.client.get("/api/recordings").json()[0]["transcript"],
+            live_transcript,
+        )
+
+    def test_final_transcription_preserves_transcripts_over_edit_limit(self) -> None:
+        audio = self.client.post(
+            "/api/recordings",
+            files={"file": ("sample.webm", b"sample audio bytes", "audio/webm")},
+        ).json()
+        complete_transcript = "doctor spoke " * 70
+
+        with patch(
+            "main.transcribe_audio_file",
+            return_value=(complete_transcript, "en"),
+        ):
+            result = self.client.post(
+                f"/api/recordings/{audio['id']}/transcribe"
+            )
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.json()["text"], complete_transcript)
+        self.assertEqual(
+            self.client.get("/api/recordings").json()[0]["transcript"],
+            complete_transcript,
+        )
+
     def test_live_transcription_commits_stable_words_from_rolling_windows(self) -> None:
         sample_rate = 8000
         window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
@@ -110,22 +279,22 @@ class RecordingApiTests(unittest.TestCase):
                         "en",
                         [
                             (0.1, 0.2, "Hello"),
-                            (2.1, 2.2, "there"),
-                            (3.2, 3.4, "Watch"),
-                            (3.55, 3.9, "this."),
+                            (0.8, 1.0, "there"),
+                            (1.4, 1.6, "Watch"),
+                            (1.8, 1.95, "this."),
                         ],
                     ),
                     (
-                        "there this. friend.",
-                        "en",
+                        "Watch this. friend.",
+                        "fr",
                         [
-                            (0.1, 0.2, "there"),
-                            (1.55, 1.9, "this."),
-                            (2.2, 2.4, "friend."),
+                            (0.0, 0.1, "Watch"),
+                            (0.4, 0.6, "this."),
+                            (1.2, 1.4, "friend."),
                         ],
                     ),
                 ],
-            ),
+            ) as transcribe_chunk,
         ):
             with self.client.websocket_connect(
                 f"/api/recordings/live?sample_rate={sample_rate}"
@@ -134,6 +303,10 @@ class RecordingApiTests(unittest.TestCase):
                 self.assertEqual(ready["type"], "status")
                 self.assertEqual(ready["window_seconds"], main.LIVE_CHUNK_SECONDS)
                 self.assertEqual(ready["overlap_seconds"], main.LIVE_OVERLAP_SECONDS)
+                self.assertEqual(
+                    ready["unstable_tail_seconds"],
+                    main.LIVE_UNSTABLE_TAIL_SECONDS,
+                )
                 websocket.send_bytes(window)
                 first = websocket.receive_json()
                 websocket.send_bytes(window)
@@ -142,8 +315,14 @@ class RecordingApiTests(unittest.TestCase):
 
         self.assertEqual(first["text"], "Hello there Watch")
         self.assertEqual(second["text"], "Hello there Watch this. friend.")
-        self.assertEqual(second["language"], "en")
+        self.assertEqual(second["language"], "fr")
         self.assertEqual(second["segment"], "this. friend.")
+        first_prompt = transcribe_chunk.call_args_list[0].args[3]
+        second_prompt = transcribe_chunk.call_args_list[1].args[3]
+        self.assertIsNone(transcribe_chunk.call_args_list[0].args[2])
+        self.assertIsNone(transcribe_chunk.call_args_list[1].args[2])
+        self.assertIn("Clinical note transcription", first_prompt)
+        self.assertIn("Recent transcript: Hello there Watch", second_prompt)
 
     def test_live_transcription_uses_word_timestamps(self) -> None:
         class FakeModel:
@@ -155,11 +334,13 @@ class RecordingApiTests(unittest.TestCase):
                 vad_filter,
                 word_timestamps,
                 beam_size,
+                initial_prompt,
             ):
                 self.language = language
                 self.vad_filter = vad_filter
                 self.word_timestamps = word_timestamps
                 self.beam_size = beam_size
+                self.initial_prompt = initial_prompt
                 words = [
                     SimpleNamespace(word=" Hello", start=0.0, end=0.2),
                     SimpleNamespace(word=" there", start=0.3, end=0.5),
@@ -181,6 +362,7 @@ class RecordingApiTests(unittest.TestCase):
         self.assertTrue(model.word_timestamps)
         self.assertEqual(model.beam_size, 1)
         self.assertEqual(model.language, "pt")
+        self.assertIn("Clinical note transcription", model.initial_prompt)
 
     def test_live_transcription_keeps_repeated_words(self) -> None:
         sample_rate = 8000
@@ -193,12 +375,12 @@ class RecordingApiTests(unittest.TestCase):
                     (
                         "no no",
                         "en",
-                        [(0.1, 0.2, "no"), (2.1, 2.2, "no")],
+                        [(0.1, 0.2, "no"), (1.4, 1.6, "no")],
                     ),
                     (
                         "no yes",
                         "en",
-                        [(0.1, 0.2, "no"), (0.5, 0.6, "yes")],
+                        [(0.0, 0.05, "no"), (0.5, 0.6, "yes")],
                     ),
                 ],
             ),
@@ -215,12 +397,68 @@ class RecordingApiTests(unittest.TestCase):
 
         self.assertEqual(second["text"], "no no yes")
 
+    def test_live_stop_commits_unstable_tail_before_closing(self) -> None:
+        sample_rate = 8000
+        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        with (
+            patch("main.get_live_whisper_model"),
+            patch(
+                "main.transcribe_pcm_chunk",
+                return_value=(
+                    "Hello important word",
+                    "en",
+                    [
+                        (0.1, 0.3, "Hello"),
+                        (1.78, 1.84, "important"),
+                        (1.86, 1.95, "word"),
+                    ],
+                ),
+            ),
+        ):
+            with self.client.websocket_connect(
+                f"/api/recordings/live?sample_rate={sample_rate}"
+            ) as websocket:
+                websocket.receive_json()
+                websocket.send_bytes(window)
+                live_result = websocket.receive_json()
+                websocket.send_text('{"type":"stop"}')
+                final_result = websocket.receive_json()
+
+        self.assertEqual(live_result["text"], "Hello")
+        self.assertEqual(live_result["segment"], "Hello")
+        self.assertEqual(final_result["text"], "Hello important word")
+        self.assertEqual(final_result["segment"], "important word")
+        self.assertEqual(final_result["language"], "en")
+
+    def test_silent_live_window_returns_transcript_ack_without_inference(self) -> None:
+        sample_rate = 8000
+        silence = b"\x00\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        with (
+            patch("main.get_live_whisper_model"),
+            patch("main.transcribe_pcm_chunk") as transcribe_chunk,
+        ):
+            with self.client.websocket_connect(
+                f"/api/recordings/live?sample_rate={sample_rate}"
+            ) as websocket:
+                websocket.receive_json()
+                websocket.send_bytes(silence)
+                response = websocket.receive_json()
+                websocket.send_text('{"type":"stop"}')
+
+        self.assertEqual(
+            response,
+            {"type": "transcript", "text": "", "segment": "", "language": None},
+        )
+        transcribe_chunk.assert_not_called()
+
     def test_live_pcm_chunk_is_wrapped_as_wav(self) -> None:
         def verify_wav(
             audio_path: Path,
             language: str | None,
+            initial_prompt: str | None,
         ) -> tuple[str, str, list[tuple[float, float, str]]]:
             self.assertIsNone(language)
+            self.assertIsNone(initial_prompt)
             with wave.open(str(audio_path), "rb") as audio_file:
                 self.assertEqual(audio_file.getnchannels(), 1)
                 self.assertEqual(audio_file.getsampwidth(), 2)
@@ -253,9 +491,106 @@ class RecordingApiTests(unittest.TestCase):
 
         transcribe_chunk.assert_called_once()
         self.assertEqual(
-            transcribe_chunk.call_args.args[1:],
+            transcribe_chunk.call_args.args[1:3],
             (sample_rate, "pt"),
         )
+        self.assertIn(
+            "Clinical note transcription",
+            transcribe_chunk.call_args.args[3],
+        )
+
+    def test_live_websocket_resumes_with_transcript_context_and_language(self) -> None:
+        sample_rate = 8000
+        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        with (
+            patch("main.get_live_whisper_model"),
+            patch(
+                "main.transcribe_pcm_chunk",
+                return_value=("there again", "en", [(1.2, 1.4, "again")]),
+            ) as transcribe_chunk,
+        ):
+            with self.client.websocket_connect(
+                f"/api/recordings/live?sample_rate={sample_rate}"
+            ) as websocket:
+                websocket.receive_json()
+                websocket.send_text(
+                    json.dumps(
+                        {
+                            "type": "resume",
+                            "transcript": "Hello there",
+                            "resume_at_seconds": 2,
+                            "language": "en",
+                        }
+                    )
+                )
+                websocket.send_bytes(window)
+                response = websocket.receive_json()
+                websocket.send_text('{"type":"stop"}')
+
+        self.assertEqual(response["segment"], "again")
+        self.assertIn("Hello there", transcribe_chunk.call_args.args[3])
+        self.assertEqual(transcribe_chunk.call_args.args[2], "en")
+
+    def test_live_websocket_ignores_unknown_query_and_resume_languages(self) -> None:
+        sample_rate = 8000
+        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        with (
+            patch("main.get_live_whisper_model"),
+            patch(
+                "main.transcribe_pcm_chunk",
+                return_value=("Hello there", "en", [(0.1, 0.3, "Hello")]),
+            ) as transcribe_chunk,
+        ):
+            with self.client.websocket_connect(
+                f"/api/recordings/live?sample_rate={sample_rate}&language=xx"
+            ) as websocket:
+                ready = websocket.receive_json()
+                websocket.send_text(
+                    '{"type":"resume","transcript":"","resume_at_seconds":0,'
+                    '"language":"unsupported"}'
+                )
+                websocket.send_bytes(window)
+                response = websocket.receive_json()
+                websocket.send_text('{"type":"stop"}')
+                final = websocket.receive_json()
+
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(response["language"], "en")
+        self.assertIsNone(transcribe_chunk.call_args.args[2])
+        self.assertEqual(final["type"], "transcript")
+
+    def test_live_websocket_initial_resume_keeps_early_words(self) -> None:
+        sample_rate = 8000
+        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        with (
+            patch("main.get_live_whisper_model"),
+            patch(
+                "main.transcribe_pcm_chunk",
+                return_value=("Hello there", "en", [(0.1, 0.3, "Hello")]),
+            ),
+        ):
+            with self.client.websocket_connect(
+                f"/api/recordings/live?sample_rate={sample_rate}"
+            ) as websocket:
+                websocket.receive_json()
+                websocket.send_text(
+                    '{"type":"resume","transcript":"","resume_at_seconds":0}'
+                )
+                websocket.send_bytes(window)
+                response = websocket.receive_json()
+                websocket.send_text('{"type":"stop"}')
+
+        self.assertEqual(response["segment"], "Hello")
+
+    def test_live_initial_prompt_keeps_only_recent_context(self) -> None:
+        words = [f"word{index}" for index in range(main.LIVE_PROMPT_CONTEXT_WORDS + 3)]
+
+        prompt = main.build_live_initial_prompt(" ".join(words))
+
+        self.assertIn("Clinical note transcription", prompt)
+        self.assertNotIn("word0", prompt)
+        self.assertIn("word3 word4 word5", prompt)
+        self.assertTrue(prompt.endswith("word50"))
 
     def test_invalid_uploads_and_unknown_recording(self) -> None:
         unsupported = self.client.post(
@@ -283,10 +618,9 @@ class RecordingApiTests(unittest.TestCase):
 
     def test_transcription_joins_segments_and_detects_language(self) -> None:
         class FakeModel:
-            def transcribe(self, audio_path, *, language, vad_filter):
+            def transcribe(self, audio_path, **kwargs):
                 self.audio_path = audio_path
-                self.language = language
-                self.vad_filter = vad_filter
+                self.kwargs = kwargs
                 segments = [
                     SimpleNamespace(text=" Hello"),
                     SimpleNamespace(text=" world."),
@@ -297,13 +631,21 @@ class RecordingApiTests(unittest.TestCase):
         model = FakeModel()
         with patch("main.get_whisper_model", return_value=model):
             transcript, language = main.transcribe_audio_file(
-                Path(self.temp_dir.name) / "sample.webm"
+                Path(self.temp_dir.name) / "sample.webm",
             )
 
         self.assertEqual(transcript, "Hello world.")
         self.assertEqual(language, "en")
-        self.assertEqual(model.language, None)
-        self.assertTrue(model.vad_filter)
+        self.assertEqual(
+            model.kwargs,
+            {
+                "language": None,
+                "vad_filter": True,
+                "condition_on_previous_text": False,
+                "word_timestamps": True,
+                "hallucination_silence_threshold": 2,
+            },
+        )
 
     def test_faster_whisper_decoder_accepts_audio(self) -> None:
         audio_path = Path(self.temp_dir.name) / "decoder-smoke.wav"
@@ -315,6 +657,12 @@ class RecordingApiTests(unittest.TestCase):
 
         decoded = decode_audio(str(audio_path))
         self.assertGreater(decoded.size, 0)
+
+    def test_audio_capture_worklet_is_served(self) -> None:
+        response = self.client.get("/static/audio-capture-worklet.js")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("registerProcessor", response.text)
 
 
 if __name__ == "__main__":
