@@ -1,5 +1,5 @@
 """Run from your clinical-notes folder:
-    python bench_live2.py data/recordings/<any recording>.webm
+    python bench_live.py data/recordings/<any recording>.webm
 Compares live-window cost for: tiny vs tiny.en, word timestamps on/off, 1 s vs 2 s windows.
 (tiny.en is downloaded the first time, so you need internet for that one run.)"""
 import os

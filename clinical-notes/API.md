@@ -48,17 +48,25 @@ Transcribe a saved recording with the local faster-whisper `small` model.
 Pass an optional `language` query parameter (for example, `?language=pt`) to
 force a language; otherwise it is detected automatically. The returned
 transcript and detected language are saved in that recording's JSON sidecar
-unless its transcript has already been reviewed. Reviewed transcripts are
-returned as-is and are not overwritten by later transcription passes. After
+unless its transcript has already been reviewed. Pass `preserve_edits=true` to
+skip the final pass when the user has unsaved transcript edits; the stored
+transcript is returned as-is. Reviewed transcripts are returned as-is and are
+not overwritten by later transcription passes. After
 saving a recording, the browser runs this final pass and replaces the
 provisional live transcript when the result is usable and the transcript
 remains unreviewed. If the final result is empty or contains a repeated-phrase
 loop, the existing live transcript is kept.
+The browser can pass `language_mode=auto`, `language_mode=expected` with a
+comma-separated `expected_languages` set, or `language_mode=single` with a
+forced `language`. The expected Hindi-and-English combination also sends
+`language=hi&prompt_style=hinglish`, which applies a fixed Roman-script example
+and medical vocabulary to the final pass.
 
 Unsupported audio types return `415`; empty uploads return `400`; files larger
 than 100 MiB return `413`; unknown recording IDs return `404`.
 
-The live `tiny` model is loaded and warmed when the server starts. The final
+The live `tiny` model is loaded and warmed when the server starts; a failed
+warm-up is logged and retried on first use. The final
 model weights download the first time a recording is transcribed, so an
 internet connection is required for those initial runs. Transcription uses the
 local CPU or an available GPU; the audio is not sent to a transcription API.
@@ -70,15 +78,22 @@ fallback remains enabled.
 
 Stream mono PCM16 audio as binary WebSocket messages. The sample rate must be
 between 8,000 and 96,000 Hz, and each audio message must be no longer than ten
-seconds. The optional `language` code forces transcription to that language;
-if omitted or unsupported, each window detects its language independently.
+seconds. `language_mode=auto` detects across languages,
+`language_mode=expected` detects only within comma-separated
+`expected_languages`, and `language_mode=single` requires a forced `language`.
+If `language_mode` is omitted, the legacy automatic/optional-language behavior
+is retained. In expected mode, the Hindi-and-English pair uses `language=hi`
+and `prompt_style=hinglish`.
 Each message is transcribed locally and returns JSON containing the cumulative
-`text`, latest `segment`, and detected `language`. Send a
+`text`, latest `segment`, any unstable-tail `unconfirmed` words, and detected
+`language`. Unconfirmed words are shown separately in grey in the recorder and
+are committed when a later window confirms them or the stream is stopped. Send a
 `{"type":"resume","transcript":"...","resume_at_seconds":2,"language":"en"}`
-text message after the ready status when reconnecting. This seeds recent
-transcript context, the audio position, and optional user-selected language
-for the resumed stream. Unknown language codes in the query or resume state
-are ignored. Send `{"type":"stop"}` as a text message to finish the stream. The
+text message after the ready status when reconnecting. This seeds the full
+transcript, the audio position, and optional user-selected language for the
+resumed stream. Transcript text is not fed back into the model prompt. Unknown
+language codes in the query or resume state are ignored. Send
+`{"type":"stop"}` as a text message to finish the stream. The
 server commits pending unstable-tail words, sends one final transcript message,
 and then closes the WebSocket.
 
@@ -88,16 +103,21 @@ overlap values to size its rolling audio windows. The server commits words
 after the configured unstable tail and deduplicates words inside the overlap
 by timestamp, preserving repeated words. Live transcription uses the `tiny`
 model, one decoding beam, and word timestamps. VAD filtering is disabled for
-the short live windows to reduce delay. Each live window uses the recent
-committed transcript and clinical-note vocabulary as its `initial_prompt`.
+the short live windows to reduce delay; very low-level windows are skipped
+before inference. Automatic and expected-language modes detect on non-silent
+windows, restrict expected-mode choices to the selected set, and require two
+consecutive confident windows before switching languages. Hinglish mode uses
+a fixed Roman-script example and medical vocabulary prompt.
 The browser captures samples with an `AudioWorklet`, buffers them in a typed
-ring buffer, and displays microphone level and live connection status.
+ring buffer, and displays microphone level and live connection status. No more
+than two windows are sent ahead; the browser waits for acknowledgements before
+sending more and reports a lagging state instead of falling further behind.
 Up to two live inference requests can run concurrently, independently of the
 serialized final transcription model. Both models use the configured
 `WHISPER_CPU_THREADS` budget, divided among concurrent workers; the final
 transcription endpoint uses `small`. The final recording
 is saved locally through `POST /api/recordings`.
 
-The browser offers automatic detection plus English, Portuguese, Hindi,
-Spanish, French, German, Italian, Arabic, Chinese, and Japanese. A selected
-language is used for both live and final transcription.
+The browser offers Auto, Expected languages (Hindi and English checked by
+default), and Single language modes. A selected language mode applies to both
+live and final transcription.

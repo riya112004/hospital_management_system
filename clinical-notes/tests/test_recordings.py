@@ -47,7 +47,7 @@ class RecordingApiTests(unittest.TestCase):
             [call.kwargs["cpu_threads"] for call in model_factory.call_args_list],
             [
                 main.WHISPER_CPU_THREADS,
-                max(1, main.WHISPER_CPU_THREADS // 2),
+                main.WHISPER_CPU_THREADS,
             ],
         )
         self.assertEqual(
@@ -56,7 +56,7 @@ class RecordingApiTests(unittest.TestCase):
         )
         self.assertEqual(
             [call.kwargs["num_workers"] for call in model_factory.call_args_list],
-            [1, 2],
+            [1, 1],
         )
 
     def test_live_transcription_requests_can_run_concurrently(self) -> None:
@@ -129,6 +129,13 @@ class RecordingApiTests(unittest.TestCase):
             self.client.get("/api/recordings").json()[0]["transcript"],
             "Hello from the recording.",
         )
+
+        with patch("main.transcribe_audio_file") as transcribe_file:
+            preserved = self.client.post(
+                f"/api/recordings/{recording['id']}/transcribe?preserve_edits=true"
+            )
+        transcribe_file.assert_not_called()
+        self.assertEqual(preserved.json()["text"], "Hello from the recording.")
 
         def finish_after_review(audio_path, *, language):
             details = main.read_recording_metadata(audio_path)
@@ -244,6 +251,56 @@ class RecordingApiTests(unittest.TestCase):
             live_transcript,
         )
 
+    def test_hinglish_final_transcription_uses_hindi_and_fixed_prompt(self) -> None:
+        recording = self.client.post(
+            "/api/recordings",
+            files={"file": ("sample.webm", b"sample audio bytes", "audio/webm")},
+        ).json()
+        audio_path = main.RECORDINGS_DIR / f"{recording['id']}.webm"
+
+        with patch(
+            "main.transcribe_audio_file",
+            return_value=("Doctor, mujhe bukhar hai.", "hi"),
+        ) as transcribe_file:
+            response = self.client.post(
+                f"/api/recordings/{recording['id']}/transcribe"
+                "?language_mode=expected&expected_languages=hi,en"
+                "&language=hi&prompt_style=hinglish"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        transcribe_file.assert_called_once_with(
+            audio_path,
+            language="hi",
+            initial_prompt=main.LIVE_HINGLISH_PROMPT,
+        )
+
+    def test_expected_final_language_is_selected_only_from_allowed_codes(self) -> None:
+        class FakeModel:
+            def detect_language(self, *, audio):
+                return "ta", 0.8, [
+                    ("ta", 0.8),
+                    ("pt", 0.12),
+                    ("fr", 0.08),
+                ]
+
+            def transcribe(self, audio_path, **kwargs):
+                self.kwargs = kwargs
+                return iter(()), SimpleNamespace(language=kwargs["language"])
+
+        model = FakeModel()
+        with (
+            patch("main.get_whisper_model", return_value=model),
+            patch("main.decode_audio", return_value=object()),
+        ):
+            _, language = main.transcribe_audio_file(
+                Path(self.temp_dir.name) / "sample.wav",
+                allowed_languages=frozenset({"pt", "fr"}),
+            )
+
+        self.assertEqual(language, "fr")
+        self.assertEqual(model.kwargs["language"], "fr")
+
     def test_final_transcription_preserves_transcripts_over_edit_limit(self) -> None:
         audio = self.client.post(
             "/api/recordings",
@@ -268,7 +325,7 @@ class RecordingApiTests(unittest.TestCase):
 
     def test_live_transcription_commits_stable_words_from_rolling_windows(self) -> None:
         sample_rate = 8000
-        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        window = b"\x00\x40" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
         with (
             patch("main.get_live_whisper_model"),
             patch(
@@ -315,14 +372,14 @@ class RecordingApiTests(unittest.TestCase):
 
         self.assertEqual(first["text"], "Hello there Watch")
         self.assertEqual(second["text"], "Hello there Watch this. friend.")
-        self.assertEqual(second["language"], "fr")
+        self.assertEqual(second["language"], "en")
         self.assertEqual(second["segment"], "this. friend.")
         first_prompt = transcribe_chunk.call_args_list[0].args[3]
         second_prompt = transcribe_chunk.call_args_list[1].args[3]
         self.assertIsNone(transcribe_chunk.call_args_list[0].args[2])
         self.assertIsNone(transcribe_chunk.call_args_list[1].args[2])
-        self.assertIn("Clinical note transcription", first_prompt)
-        self.assertIn("Recent transcript: Hello there Watch", second_prompt)
+        self.assertEqual(first_prompt, main.LIVE_MEDICAL_PROMPT)
+        self.assertEqual(second_prompt, main.LIVE_MEDICAL_PROMPT)
 
     def test_live_transcription_uses_word_timestamps(self) -> None:
         class FakeModel:
@@ -334,12 +391,14 @@ class RecordingApiTests(unittest.TestCase):
                 vad_filter,
                 word_timestamps,
                 beam_size,
+                temperature,
                 initial_prompt,
             ):
                 self.language = language
                 self.vad_filter = vad_filter
                 self.word_timestamps = word_timestamps
                 self.beam_size = beam_size
+                self.temperature = temperature
                 self.initial_prompt = initial_prompt
                 words = [
                     SimpleNamespace(word=" Hello", start=0.0, end=0.2),
@@ -361,12 +420,13 @@ class RecordingApiTests(unittest.TestCase):
         self.assertFalse(model.vad_filter)
         self.assertTrue(model.word_timestamps)
         self.assertEqual(model.beam_size, 1)
+        self.assertEqual(model.temperature, 0.0)
         self.assertEqual(model.language, "pt")
         self.assertIn("Clinical note transcription", model.initial_prompt)
 
     def test_live_transcription_keeps_repeated_words(self) -> None:
         sample_rate = 8000
-        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        window = b"\x00\x40" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
         with (
             patch("main.get_live_whisper_model"),
             patch(
@@ -399,7 +459,7 @@ class RecordingApiTests(unittest.TestCase):
 
     def test_live_stop_commits_unstable_tail_before_closing(self) -> None:
         sample_rate = 8000
-        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        window = b"\x00\x40" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
         with (
             patch("main.get_live_whisper_model"),
             patch(
@@ -426,8 +486,10 @@ class RecordingApiTests(unittest.TestCase):
 
         self.assertEqual(live_result["text"], "Hello")
         self.assertEqual(live_result["segment"], "Hello")
+        self.assertEqual(live_result["unconfirmed"], "important word")
         self.assertEqual(final_result["text"], "Hello important word")
         self.assertEqual(final_result["segment"], "important word")
+        self.assertEqual(final_result["unconfirmed"], "")
         self.assertEqual(final_result["language"], "en")
 
     def test_silent_live_window_returns_transcript_ack_without_inference(self) -> None:
@@ -436,9 +498,12 @@ class RecordingApiTests(unittest.TestCase):
         with (
             patch("main.get_live_whisper_model"),
             patch("main.transcribe_pcm_chunk") as transcribe_chunk,
+            patch("main.detect_pcm_language") as detect_language,
         ):
             with self.client.websocket_connect(
                 f"/api/recordings/live?sample_rate={sample_rate}"
+                "&language_mode=expected&expected_languages=hi,en"
+                "&language=hi&prompt_style=hinglish"
             ) as websocket:
                 websocket.receive_json()
                 websocket.send_bytes(silence)
@@ -447,8 +512,33 @@ class RecordingApiTests(unittest.TestCase):
 
         self.assertEqual(
             response,
-            {"type": "transcript", "text": "", "segment": "", "language": None},
+            {
+                "type": "transcript",
+                "text": "",
+                "segment": "",
+                "unconfirmed": "",
+                "language": "hi",
+            },
         )
+        transcribe_chunk.assert_not_called()
+        detect_language.assert_not_called()
+
+    def test_low_level_live_window_skips_inference(self) -> None:
+        sample_rate = 8000
+        quiet = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        with (
+            patch("main.get_live_whisper_model"),
+            patch("main.transcribe_pcm_chunk") as transcribe_chunk,
+        ):
+            with self.client.websocket_connect(
+                f"/api/recordings/live?sample_rate={sample_rate}"
+            ) as websocket:
+                websocket.receive_json()
+                websocket.send_bytes(quiet)
+                response = websocket.receive_json()
+                websocket.send_text('{"type":"stop"}')
+
+        self.assertEqual(response["segment"], "")
         transcribe_chunk.assert_not_called()
 
     def test_live_pcm_chunk_is_wrapped_as_wav(self) -> None:
@@ -471,9 +561,27 @@ class RecordingApiTests(unittest.TestCase):
 
         self.assertEqual(result, ("Hello", "en", [(0.0, 0.1, "Hello")]))
 
+    def test_live_language_detection_resamples_pcm_to_16khz(self) -> None:
+        class FakeModel:
+            def detect_language(self, *, audio):
+                self.audio = audio
+                return "hi", 0.8, [("hi", 0.8), ("en", 0.2)]
+
+        model = FakeModel()
+        with patch("main.get_live_whisper_model", return_value=model):
+            audio, language, confidence, probabilities = main.detect_pcm_language(
+                b"\x01\x00" * 800,
+                8000,
+            )
+
+        self.assertEqual(len(audio), 1600)
+        self.assertEqual(model.audio.shape, audio.shape)
+        self.assertEqual((language, confidence), ("hi", 0.8))
+        self.assertEqual(probabilities[0], ("hi", 0.8))
+
     def test_live_websocket_passes_selected_language_to_transcription(self) -> None:
         sample_rate = 8000
-        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        window = b"\x00\x40" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
         with (
             patch("main.get_live_whisper_model"),
             patch(
@@ -482,7 +590,8 @@ class RecordingApiTests(unittest.TestCase):
             ) as transcribe_chunk,
         ):
             with self.client.websocket_connect(
-                f"/api/recordings/live?sample_rate={sample_rate}&language=pt"
+                f"/api/recordings/live?sample_rate={sample_rate}"
+                "&language_mode=single&language=pt"
             ) as websocket:
                 websocket.receive_json()
                 websocket.send_bytes(window)
@@ -499,9 +608,99 @@ class RecordingApiTests(unittest.TestCase):
             transcribe_chunk.call_args.args[3],
         )
 
+    def test_live_websocket_hinglish_uses_hindi_and_fixed_prompt(self) -> None:
+        sample_rate = 8000
+        window = b"\x00\x40" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        detected_audio = object()
+        with (
+            patch("main.get_live_whisper_model"),
+            patch(
+                "main.detect_pcm_language",
+                return_value=(
+                    detected_audio,
+                    "en",
+                    0.9,
+                    [("en", 0.9), ("hi", 0.08), ("ta", 0.02)],
+                ),
+            ),
+            patch(
+                "main.transcribe_live_audio",
+                return_value=("Doctor, mujhe bukhar hai.", "hi", []),
+            ) as transcribe_audio,
+        ):
+            with self.client.websocket_connect(
+                f"/api/recordings/live?sample_rate={sample_rate}"
+                "&language_mode=expected&expected_languages=hi,en"
+                "&language=hi&prompt_style=hinglish"
+            ) as websocket:
+                websocket.receive_json()
+                websocket.send_bytes(window)
+                response = websocket.receive_json()
+                websocket.send_text('{"type":"stop"}')
+
+        self.assertEqual(response["language"], "hi")
+        transcribe_audio.assert_called_once_with(
+            detected_audio,
+            "hi",
+            main.LIVE_HINGLISH_PROMPT,
+        )
+
+    def test_expected_language_selection_rejects_foreign_language_noise(self) -> None:
+        language, confidence = main.select_detected_language(
+            [("ta", 0.86), ("hi", 0.09), ("en", 0.05)],
+            frozenset({"hi", "en"}),
+        )
+
+        self.assertIsNone(language)
+        self.assertEqual(confidence, 0.09)
+
+    def test_expected_language_changes_need_two_confident_windows(self) -> None:
+        sample_rate = 8000
+        window = b"\x00\x40" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        detections = [
+            ("pt", 0.9, [("pt", 0.9), ("fr", 0.05)]),
+            ("pt", 0.9, [("pt", 0.9), ("fr", 0.05)]),
+            ("fr", 0.9, [("fr", 0.9), ("pt", 0.05)]),
+            ("fr", 0.9, [("fr", 0.9), ("pt", 0.05)]),
+        ]
+        with (
+            patch("main.get_live_whisper_model"),
+            patch(
+                "main.detect_pcm_language",
+                side_effect=[
+                    (object(), language, confidence, probabilities)
+                    for language, confidence, probabilities in detections
+                ],
+            ),
+            patch(
+                "main.transcribe_live_audio",
+                side_effect=lambda audio, language, prompt: ("", language, []),
+            ) as transcribe_audio,
+        ):
+            with self.client.websocket_connect(
+                f"/api/recordings/live?sample_rate={sample_rate}"
+                "&language_mode=expected&expected_languages=pt,fr"
+            ) as websocket:
+                websocket.receive_json()
+                responses = []
+                for _ in detections:
+                    websocket.send_bytes(window)
+                    responses.append(websocket.receive_json())
+                websocket.send_text('{"type":"stop"}')
+                websocket.receive_json()
+
+        self.assertEqual(
+            [call.args[1] for call in transcribe_audio.call_args_list],
+            ["pt", "pt", "fr"],
+        )
+        self.assertEqual(
+            [response["language"] for response in responses],
+            [None, "pt", "pt", "fr"],
+        )
+
     def test_live_websocket_resumes_with_transcript_context_and_language(self) -> None:
         sample_rate = 8000
-        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        window = b"\x00\x40" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
         with (
             patch("main.get_live_whisper_model"),
             patch(
@@ -528,12 +727,16 @@ class RecordingApiTests(unittest.TestCase):
                 websocket.send_text('{"type":"stop"}')
 
         self.assertEqual(response["segment"], "again")
-        self.assertIn("Hello there", transcribe_chunk.call_args.args[3])
+        self.assertEqual(response["text"], "Hello there again")
+        self.assertEqual(
+            transcribe_chunk.call_args.args[3],
+            main.LIVE_MEDICAL_PROMPT,
+        )
         self.assertEqual(transcribe_chunk.call_args.args[2], "en")
 
     def test_live_websocket_ignores_unknown_query_and_resume_languages(self) -> None:
         sample_rate = 8000
-        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        window = b"\x00\x40" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
         with (
             patch("main.get_live_whisper_model"),
             patch(
@@ -561,7 +764,7 @@ class RecordingApiTests(unittest.TestCase):
 
     def test_live_websocket_initial_resume_keeps_early_words(self) -> None:
         sample_rate = 8000
-        window = b"\x01\x00" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
+        window = b"\x00\x40" * int(sample_rate * main.LIVE_CHUNK_SECONDS)
         with (
             patch("main.get_live_whisper_model"),
             patch(
@@ -582,15 +785,23 @@ class RecordingApiTests(unittest.TestCase):
 
         self.assertEqual(response["segment"], "Hello")
 
-    def test_live_initial_prompt_keeps_only_recent_context(self) -> None:
-        words = [f"word{index}" for index in range(main.LIVE_PROMPT_CONTEXT_WORDS + 3)]
-
-        prompt = main.build_live_initial_prompt(" ".join(words))
-
-        self.assertIn("Clinical note transcription", prompt)
-        self.assertNotIn("word0", prompt)
-        self.assertIn("word3 word4 word5", prompt)
-        self.assertTrue(prompt.endswith("word50"))
+    def test_live_initial_prompt_is_static_and_style_specific(self) -> None:
+        self.assertEqual(
+            main.build_live_initial_prompt(),
+            main.LIVE_MEDICAL_PROMPT,
+        )
+        self.assertEqual(
+            main.build_live_initial_prompt("hinglish"),
+            main.LIVE_HINGLISH_PROMPT,
+        )
+        self.assertIn(
+            "Doctor, mujhe bukhar hai aur headache ho raha hai.",
+            main.build_live_initial_prompt("hinglish"),
+        )
+        self.assertNotIn(
+            "Recent transcript:",
+            main.build_live_initial_prompt("hinglish"),
+        )
 
     def test_invalid_uploads_and_unknown_recording(self) -> None:
         unsupported = self.client.post(
@@ -644,6 +855,7 @@ class RecordingApiTests(unittest.TestCase):
                 "condition_on_previous_text": False,
                 "word_timestamps": True,
                 "hallucination_silence_threshold": 2,
+                "initial_prompt": None,
             },
         )
 

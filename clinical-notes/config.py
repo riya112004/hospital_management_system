@@ -18,7 +18,8 @@ WHISPER_CPU_THREADS = os.cpu_count() or 4
 TRANSCRIPTION_LANGUAGE_CODES = frozenset(
     {"ar", "de", "en", "es", "fr", "hi", "it", "ja", "pt", "zh"}
 )
-LIVE_PROMPT_CONTEXT_WORDS = 48
+LIVE_LANGUAGE_CONFIDENCE_THRESHOLD = 0.55
+LIVE_LANGUAGE_CONFIRMATION_WINDOWS = 2
 LIVE_MEDICAL_PROMPT = (
     "Clinical note transcription. Common terms include patient, chief complaint, "
     "history of present illness, medical history, examination, assessment, "
@@ -26,9 +27,16 @@ LIVE_MEDICAL_PROMPT = (
     "heart rate, respiratory rate, hypertension, diabetes, asthma, infection, "
     "follow-up, prescription, and laboratory results."
 )
+LIVE_HINGLISH_PROMPT = (
+    "Clinical note transcription in Roman Hindi mixed with English. "
+    "Medical vocabulary: doctor, patient, bukhar, headache, blood pressure. "
+    "Example: Doctor, mujhe bukhar hai aur headache ho raha hai. "
+    "Blood pressure check karna hai."
+)
 LIVE_CHUNK_SECONDS = 2.0
 LIVE_OVERLAP_SECONDS = 0.5
 LIVE_UNSTABLE_TAIL_SECONDS = 0.25
+LIVE_SILENCE_RMS = 0.008
 
 ALLOWED_AUDIO_TYPES = {
     "audio/aac": "aac",

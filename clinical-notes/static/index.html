@@ -168,6 +168,47 @@
         opacity: 0.6;
       }
 
+      .language-options {
+        width: min(100%, 320px);
+        margin: -8px auto 18px;
+        padding: 10px 12px;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px 12px;
+        border: 1px solid #d5e0e3;
+        border-radius: 10px;
+        color: #425765;
+        font-size: 0.85rem;
+      }
+
+      .language-options legend {
+        padding: 0 4px;
+        font-size: 0.9rem;
+        font-weight: 650;
+      }
+
+      .language-options label {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+      }
+
+      .language-options input {
+        accent-color: #147d72;
+      }
+
+      .language-options input:disabled {
+        cursor: not-allowed;
+      }
+
+      .language-hint {
+        grid-column: 1 / -1;
+        margin: 0;
+        color: #60717e;
+        font-size: 0.8rem;
+        font-weight: 400;
+      }
+
       .live-monitor {
         width: min(100%, 320px);
         margin: 0 auto 18px;
@@ -311,6 +352,13 @@
         outline-offset: 2px;
       }
 
+      .transcript-unconfirmed {
+        margin: 6px 2px 0;
+        color: #78878e;
+        font-size: 0.9rem;
+        line-height: 1.45;
+      }
+
       .transcript-actions {
         margin-top: 10px;
         display: flex;
@@ -437,13 +485,36 @@
           <span id="status-text">Ready to record</span>
         </p>
 
-        <label class="language-control" for="language-select">
-          Transcription language
-          <select id="language-select">
-            <option value="">Automatic</option>
+        <label class="language-control" for="language-mode">
+          Transcription language mode
+          <select id="language-mode">
+            <option value="auto">Auto</option>
+            <option value="expected" selected>Expected languages</option>
+            <option value="single">Single language</option>
+          </select>
+        </label>
+        <fieldset class="language-options" id="expected-language-options">
+          <legend>Expected languages</legend>
+          <label><input type="checkbox" value="hi" checked /> Hindi</label>
+          <label><input type="checkbox" value="en" checked /> English</label>
+          <label><input type="checkbox" value="pt" /> Portuguese</label>
+          <label><input type="checkbox" value="es" /> Spanish</label>
+          <label><input type="checkbox" value="fr" /> French</label>
+          <label><input type="checkbox" value="de" /> German</label>
+          <label><input type="checkbox" value="it" /> Italian</label>
+          <label><input type="checkbox" value="ar" /> Arabic</label>
+          <label><input type="checkbox" value="zh" /> Chinese</label>
+          <label><input type="checkbox" value="ja" /> Japanese</label>
+          <p class="language-hint" id="hinglish-hint" hidden>
+            Hindi + English uses Hinglish mode with a Roman-script prompt.
+          </p>
+        </fieldset>
+        <label class="language-control" id="single-language-control" for="single-language" hidden>
+          Single language
+          <select id="single-language">
             <option value="en">English</option>
-            <option value="pt">Portuguese</option>
             <option value="hi">Hindi</option>
+            <option value="pt">Portuguese</option>
             <option value="es">Spanish</option>
             <option value="fr">French</option>
             <option value="de">German</option>
@@ -508,6 +579,9 @@
           maxlength="50000"
           placeholder="Your spoken words will appear here as you speak."
         ></textarea>
+        <p class="transcript-unconfirmed" id="transcript-unconfirmed" hidden>
+          <span>Unconfirmed: </span><span id="transcript-unconfirmed-text"></span>
+        </p>
         <div class="transcript-actions">
           <button class="transcript-action" id="copy-transcript-button" type="button" disabled>
             Copy
@@ -527,7 +601,12 @@
       const startButton = document.querySelector("#start-button");
       const stopButton = document.querySelector("#stop-button");
       const pauseButton = document.querySelector("#pause-button");
-      const languageSelect = document.querySelector("#language-select");
+      const languageModeSelect = document.querySelector("#language-mode");
+      const expectedLanguageOptions = document.querySelector("#expected-language-options");
+      const expectedLanguageInputs = expectedLanguageOptions.querySelectorAll("input");
+      const hinglishHint = document.querySelector("#hinglish-hint");
+      const singleLanguageControl = document.querySelector("#single-language-control");
+      const singleLanguageSelect = document.querySelector("#single-language");
       const liveMonitor = document.querySelector("#live-monitor");
       const liveConnectionState = document.querySelector("#live-connection-state");
       const microphoneMeter = document.querySelector("#microphone-meter");
@@ -540,6 +619,8 @@
       const audioName = document.querySelector("#audio-name");
       const previewPlaceholder = document.querySelector("#preview-placeholder");
       const transcriptBox = document.querySelector("#transcript-box");
+      const transcriptUnconfirmed = document.querySelector("#transcript-unconfirmed");
+      const transcriptUnconfirmedText = document.querySelector("#transcript-unconfirmed-text");
       const copyTranscriptButton = document.querySelector("#copy-transcript-button");
       const saveTranscriptButton = document.querySelector("#save-transcript-button");
       const recordingsList = document.querySelector("#recordings-list");
@@ -586,6 +667,78 @@
       let audioFlushResolve;
 
       const LIVE_AUDIO_BUFFER_SECONDS = 120;
+      const HINGLISH_LANGUAGE_CODES = ["en", "hi"];
+
+      function getLanguageSettings() {
+        const mode = languageModeSelect.value;
+        if (mode === "expected") {
+          const expectedLanguages = Array.from(expectedLanguageInputs)
+            .filter((input) => input.checked)
+            .map((input) => input.value);
+          if (expectedLanguages.length === 0) return null;
+          return { mode, expectedLanguages };
+        }
+        if (mode === "single") {
+          return { mode, language: singleLanguageSelect.value };
+        }
+        return { mode: "auto", expectedLanguages: [] };
+      }
+
+      function isHinglishMode(settings) {
+        return (
+          settings !== null &&
+          settings.mode === "expected" &&
+          settings.expectedLanguages.length === HINGLISH_LANGUAGE_CODES.length &&
+          HINGLISH_LANGUAGE_CODES.every((language) =>
+            settings.expectedLanguages.includes(language),
+          )
+        );
+      }
+
+      function getForcedLanguage(settings) {
+        if (settings.mode === "single") return settings.language;
+        if (isHinglishMode(settings)) return "hi";
+        return null;
+      }
+
+      function appendLanguageSettings(parameters, settings, detectedLanguage = null) {
+        parameters.set("language_mode", settings.mode);
+        if (settings.mode === "expected") {
+          parameters.set("expected_languages", settings.expectedLanguages.join(","));
+        }
+        const language =
+          getForcedLanguage(settings) ||
+          (settings.mode === "expected" &&
+          settings.expectedLanguages.includes(detectedLanguage)
+            ? detectedLanguage
+            : null);
+        if (language) parameters.set("language", language);
+        if (isHinglishMode(settings)) {
+          parameters.set("prompt_style", "hinglish");
+        }
+      }
+
+      function updateLanguageModeControls() {
+        expectedLanguageOptions.hidden = languageModeSelect.value !== "expected";
+        singleLanguageControl.hidden = languageModeSelect.value !== "single";
+        hinglishHint.hidden =
+          languageModeSelect.value !== "expected" ||
+          !isHinglishMode(getLanguageSettings());
+      }
+
+      function setLanguageControlsDisabled(disabled) {
+        languageModeSelect.disabled = disabled;
+        singleLanguageSelect.disabled = disabled;
+        expectedLanguageInputs.forEach((input) => {
+          input.disabled = disabled;
+        });
+      }
+
+      languageModeSelect.addEventListener("change", updateLanguageModeControls);
+      expectedLanguageInputs.forEach((input) => {
+        input.addEventListener("change", updateLanguageModeControls);
+      });
+      updateLanguageModeControls();
 
       class FloatSampleRingBuffer {
         constructor(capacity) {
@@ -696,6 +849,11 @@
           !selectedRecordingId || !transcriptDirty;
       }
 
+      function updateUnconfirmedTranscript(text) {
+        transcriptUnconfirmedText.textContent = text;
+        transcriptUnconfirmed.hidden = !text;
+      }
+
       function stopTracks() {
         if (mediaStream) {
           mediaStream.getTracks().forEach((track) => track.stop());
@@ -721,6 +879,7 @@
         audioName.hidden = true;
         previewPlaceholder.hidden = false;
         transcriptBox.value = "";
+        updateUnconfirmedTranscript("");
         transcriptBox.placeholder =
           "Your spoken words will appear here as you speak.";
         liveTranscript = "";
@@ -775,6 +934,10 @@
           nextWindowStart + liveWindowSamples <=
           sampleRingBuffer.totalSamples
         ) {
+          if (pendingWindows >= 2) {
+            setLiveState("lagging");
+            return;
+          }
           if (!sendRingWindow(nextWindowStart, liveWindowSamples)) return;
           nextWindowStart += liveWindowStrideSamples;
         }
@@ -937,7 +1100,7 @@
         const parameters = new URLSearchParams({
           sample_rate: String(liveSampleRate),
         });
-        if (recordingLanguage) parameters.set("language", recordingLanguage);
+        appendLanguageSettings(parameters, recordingLanguage);
         const socketUrl =
           `${protocol}//${window.location.host}/api/recordings/live?${parameters}`;
         const socket = new WebSocket(socketUrl);
@@ -966,9 +1129,9 @@
                 socket.send(
                   JSON.stringify({
                     type: "resume",
-                    transcript: liveTranscript.split(/\s+/).slice(-48).join(" "),
+                    transcript: liveTranscript,
                     resume_at_seconds: nextWindowStart / liveSampleRate,
-                    language: recordingLanguage || null,
+                    language: getForcedLanguage(recordingLanguage),
                   }),
                 );
               } catch (error) {
@@ -1028,11 +1191,14 @@
         }
         pendingWindows = pendingWindowStarts.length;
         reconnectAttempt = 0;
-        if (message.segment) {
+        if (typeof message.text === "string") {
+          liveTranscript = message.text;
+        } else if (message.segment) {
           liveTranscript = [liveTranscript, message.segment.trim()]
             .filter(Boolean)
             .join(" ");
         }
+        updateUnconfirmedTranscript(message.unconfirmed || "");
         liveLanguage = message.language || liveLanguage;
         if (!transcriptDirty) {
           userEdited = false;
@@ -1041,6 +1207,7 @@
         }
         if (!liveFinishing) {
           setLiveState(pendingWindows > 1 ? "lagging" : "listening");
+          sendPendingLiveWindows();
         }
         if (mediaRecorder?.state === "recording") {
           setStatus("Live transcription active", "recording");
@@ -1185,6 +1352,7 @@
             );
             userEdited = false;
             transcriptBox.value = recording.transcript || "";
+            updateUnconfirmedTranscript("");
             transcriptBox.placeholder =
               "Your spoken words will appear here as you speak.";
             savedTranscript = transcriptBox.value;
@@ -1259,18 +1427,24 @@
         return `Server returned HTTP ${response.status}. Check the Uvicorn terminal for details.`;
       }
 
-      async function transcribeRecording(recordingId, language) {
+      async function transcribeRecording(
+        recordingId,
+        languageSettings,
+        detectedLanguage,
+        preserveEdits = false,
+      ) {
         const isSelected = () => selectedRecordingId === recordingId;
         if (isSelected() && !transcriptBox.value && !transcriptDirty) {
           transcriptBox.placeholder = "Loading speech model and transcribing...";
         }
         if (isSelected()) setStatus("Finalizing transcript...", "recording");
 
-        const languageParameter = language
-          ? `?language=${encodeURIComponent(language)}`
-          : "";
+        const parameters = new URLSearchParams();
+        appendLanguageSettings(parameters, languageSettings, detectedLanguage);
+        if (preserveEdits) parameters.set("preserve_edits", "true");
+        const query = parameters.size ? `?${parameters}` : "";
         const response = await fetch(
-          `/api/recordings/${recordingId}/transcribe${languageParameter}`,
+          `/api/recordings/${recordingId}/transcribe${query}`,
           {
             method: "POST",
           },
@@ -1403,8 +1577,18 @@
         }
         if (!userEdited) transcriptBox.value = transcript || "";
         updateTranscriptActions();
-        setStatus("Recording saved. Finalizing transcript in the background...", "recording");
-        void transcribeRecording(recording.id, transcriptionLanguage).catch((error) => {
+        setStatus(
+          transcriptDirty
+            ? "Recording saved. Edited transcript kept."
+            : "Recording saved. Finalizing transcript in the background...",
+          "recording",
+        );
+        void transcribeRecording(
+          recording.id,
+          transcriptionLanguage,
+          language,
+          transcriptDirty,
+        ).catch((error) => {
           if (selectedRecordingId !== recording.id) return;
           if (transcript) {
             if (!transcriptDirty) {
@@ -1448,10 +1632,15 @@
           return;
         }
 
+        const selectedLanguageSettings = getLanguageSettings();
+        if (!selectedLanguageSettings) {
+          setStatus("Choose at least one expected language.", "error");
+          return;
+        }
+
         startButton.disabled = true;
-        languageSelect.disabled = true;
+        setLanguageControlsDisabled(true);
         setStatus("Requesting microphone access...", "ready");
-        const selectedLanguage = languageSelect.value || undefined;
 
         try {
           mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1489,7 +1678,7 @@
           pendingWindowStarts = [];
           lastAcknowledgedWindowStart = undefined;
           audioFlushResolve = undefined;
-          recordingLanguage = selectedLanguage;
+          recordingLanguage = selectedLanguageSettings;
           liveMonitor.hidden = false;
           setLiveState("connecting");
           setMicrophoneLevel(0);
@@ -1503,7 +1692,7 @@
             stopButton.disabled = true;
             pauseButton.disabled = true;
             startButton.disabled = false;
-            languageSelect.disabled = false;
+            setLanguageControlsDisabled(false);
             liveMonitor.hidden = true;
             setStatus("Recording failed. Please try again.", "error");
           });
@@ -1521,7 +1710,7 @@
             if (recordingBlob.size === 0) {
               setStatus("No audio was captured. Please try again.", "error");
               startButton.disabled = false;
-              languageSelect.disabled = false;
+              setLanguageControlsDisabled(false);
               liveMonitor.hidden = true;
               return;
             }
@@ -1548,7 +1737,7 @@
               );
             } finally {
               startButton.disabled = false;
-              languageSelect.disabled = false;
+              setLanguageControlsDisabled(false);
             }
           });
 
@@ -1566,7 +1755,7 @@
         } catch (error) {
           stopTracks();
           startButton.disabled = false;
-          languageSelect.disabled = false;
+          setLanguageControlsDisabled(false);
           const message =
             error.name === "NotAllowedError"
               ? "Microphone access was denied. Allow microphone access and try again."

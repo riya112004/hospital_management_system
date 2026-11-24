@@ -1,19 +1,22 @@
 import asyncio
+from array import array
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 import json
+import logging
 import math
 from pathlib import Path
 import re
+import sys
 import tempfile
 from threading import Lock
 from typing import Annotated, AsyncIterator
 from uuid import UUID, uuid4
 import wave
 
+import numpy as np
 from fastapi import (
     FastAPI,
     File,
@@ -26,6 +29,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from faster_whisper import WhisperModel
+from faster_whisper.audio import decode_audio
 from pydantic import BaseModel, Field
 
 from config import (
@@ -34,9 +38,12 @@ from config import (
     APP_TITLE,
     CHUNK_SIZE,
     LIVE_CHUNK_SECONDS,
+    LIVE_HINGLISH_PROMPT,
+    LIVE_LANGUAGE_CONFIDENCE_THRESHOLD,
+    LIVE_LANGUAGE_CONFIRMATION_WINDOWS,
     LIVE_MEDICAL_PROMPT,
     LIVE_OVERLAP_SECONDS,
-    LIVE_PROMPT_CONTEXT_WORDS,
+    LIVE_SILENCE_RMS,
     LIVE_UNSTABLE_TAIL_SECONDS,
     LIVE_WHISPER_MODEL_SIZE,
     MAX_RECORDING_BYTES,
@@ -49,6 +56,7 @@ from config import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
 EXTENSION_AUDIO_TYPES = {
     extension: content_type
     for content_type, extension in ALLOWED_AUDIO_TYPES.items()
@@ -59,21 +67,12 @@ RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def warm_live_model() -> None:
-    get_live_whisper_model()
-    silence = b"\x00\x00" * int(16_000 * LIVE_CHUNK_SECONDS)
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [
-            executor.submit(
-                transcribe_pcm_chunk,
-                silence,
-                16_000,
-                None,
-                LIVE_MEDICAL_PROMPT,
-            )
-            for _ in range(2)
-        ]
-        for future in futures:
-            future.result()
+    try:
+        get_live_whisper_model()
+        silence = b"\x00\x00" * int(16_000 * LIVE_CHUNK_SECONDS)
+        transcribe_pcm_chunk(silence, 16_000, None, LIVE_MEDICAL_PROMPT)
+    except Exception:
+        LOGGER.warning("Live model warm-up failed; it will retry on first use", exc_info=True)
 
 
 @asynccontextmanager
@@ -151,7 +150,7 @@ def get_whisper_model() -> WhisperModel:
 
 @lru_cache(maxsize=1)
 def get_live_whisper_model() -> WhisperModel:
-    return create_whisper_model(LIVE_WHISPER_MODEL_SIZE, num_workers=2)
+    return create_whisper_model(LIVE_WHISPER_MODEL_SIZE, num_workers=1)
 
 
 def create_whisper_model(model_size: str, *, num_workers: int = 1) -> WhisperModel:
@@ -187,9 +186,21 @@ def transcribe_audio_file(
     *,
     language: str | None = None,
     vad_filter: bool = True,
+    initial_prompt: str | None = None,
+    allowed_languages: frozenset[str] | None = None,
 ) -> tuple[str, str | None]:
     with FINAL_TRANSCRIPTION_LOCK:
         model = get_whisper_model()
+        if language is None and allowed_languages:
+            audio = decode_audio(str(audio_path), sampling_rate=16000)
+            _, _, probabilities = model.detect_language(audio=audio)
+            language, _ = select_detected_language(
+                probabilities,
+                allowed_languages,
+                confidence_threshold=0.0,
+            )
+            if language is None:
+                language = min(allowed_languages)
         segments, info = model.transcribe(
             str(audio_path),
             language=language,
@@ -197,6 +208,7 @@ def transcribe_audio_file(
             condition_on_previous_text=False,
             word_timestamps=True,
             hallucination_silence_threshold=2,
+            initial_prompt=initial_prompt,
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
     return text, info.language
@@ -207,13 +219,26 @@ def transcribe_live_audio_file(
     language: str | None = None,
     initial_prompt: str | None = None,
 ) -> tuple[str, str | None, list[tuple[float, float, str]]]:
+    return transcribe_live_audio(
+        str(audio_path),
+        language=language,
+        initial_prompt=initial_prompt,
+    )
+
+
+def transcribe_live_audio(
+    audio: str | np.ndarray,
+    language: str | None = None,
+    initial_prompt: str | None = None,
+) -> tuple[str, str | None, list[tuple[float, float, str]]]:
     model = get_live_whisper_model()
     segments, info = model.transcribe(
-        str(audio_path),
+        audio,
         language=language,
         vad_filter=False,
         word_timestamps=True,
         beam_size=1,
+        temperature=0.0,
         initial_prompt=initial_prompt or LIVE_MEDICAL_PROMPT,
     )
     words: list[tuple[float, float, str]] = []
@@ -227,6 +252,28 @@ def transcribe_live_audio_file(
 
     text = " ".join(word for _, _, word in words)
     return text, info.language, words
+
+
+def detect_pcm_language(
+    pcm: bytes,
+    sample_rate: int,
+) -> tuple[np.ndarray, str, float, list[tuple[str, float]]]:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio_file:
+        audio_path = Path(audio_file.name)
+
+    try:
+        with wave.open(str(audio_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(pcm)
+        audio = decode_audio(str(audio_path), sampling_rate=16000)
+        language, confidence, probabilities = get_live_whisper_model().detect_language(
+            audio=audio,
+        )
+        return audio, language, confidence, probabilities
+    finally:
+        audio_path.unlink(missing_ok=True)
 
 
 def transcribe_pcm_chunk(
@@ -249,11 +296,91 @@ def transcribe_pcm_chunk(
         audio_path.unlink(missing_ok=True)
 
 
-def build_live_initial_prompt(recent_transcript: str) -> str:
-    recent_words = recent_transcript.split()[-LIVE_PROMPT_CONTEXT_WORDS:]
-    if not recent_words:
-        return LIVE_MEDICAL_PROMPT
-    return f"{LIVE_MEDICAL_PROMPT} Recent transcript: {' '.join(recent_words)}"
+def pcm_rms(pcm: bytes) -> float:
+    samples = array("h")
+    samples.frombytes(pcm)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return 0.0
+    return math.sqrt(
+        math.fsum(sample * sample for sample in samples) / len(samples)
+    ) / 32768.0
+
+
+def build_unconfirmed_text(
+    pending_words: list[tuple[float, float, str]],
+    last_word_end: float,
+    tolerance: float,
+    transcript_words: list[str],
+) -> str:
+    unconfirmed: list[str] = []
+    pending_end = last_word_end
+    previous_word = transcript_words[-1] if transcript_words else None
+    for word_start, word_end, word_text in sorted(
+        pending_words,
+        key=lambda word: (word[0], word[1]),
+    ):
+        if word_end <= pending_end + tolerance:
+            continue
+        if (
+            word_start < pending_end - tolerance
+            and previous_word
+            and previous_word.casefold() == word_text.casefold()
+        ):
+            continue
+        unconfirmed.append(word_text)
+        pending_end = max(pending_end, word_end)
+        previous_word = word_text
+    return " ".join(unconfirmed)
+
+
+def parse_expected_languages(value: str | None) -> frozenset[str]:
+    if not value:
+        raise ValueError("Expected languages must not be empty")
+    languages = frozenset(language.strip() for language in value.split(","))
+    if (
+        not languages
+        or "" in languages
+        or not languages.issubset(TRANSCRIPTION_LANGUAGE_CODES)
+    ):
+        raise ValueError("Expected languages contain an unsupported code")
+    return languages
+
+
+def select_detected_language(
+    probabilities: list[tuple[str, float]],
+    allowed_languages: frozenset[str] | None,
+    *,
+    confidence_threshold: float = LIVE_LANGUAGE_CONFIDENCE_THRESHOLD,
+) -> tuple[str | None, float]:
+    if not probabilities:
+        return None, 0.0
+    most_likely_language, _ = max(
+        probabilities,
+        key=lambda result: result[1],
+    )
+    eligible = [
+        (language, probability)
+        for language, probability in probabilities
+        if allowed_languages is None or language in allowed_languages
+    ]
+    if not eligible:
+        return None, 0.0
+    language, confidence = max(eligible, key=lambda result: result[1])
+    if allowed_languages is not None and most_likely_language not in allowed_languages:
+        return None, confidence
+    return (
+        (language, confidence)
+        if confidence >= confidence_threshold
+        else (None, confidence)
+    )
+
+
+def build_live_initial_prompt(prompt_style: str | None = None) -> str:
+    if prompt_style == "hinglish":
+        return LIVE_HINGLISH_PROMPT
+    return LIVE_MEDICAL_PROMPT
 
 
 def recording_response(audio_path: Path) -> RecordingOut:
@@ -358,12 +485,60 @@ async def transcribe_live(
     websocket: WebSocket,
     sample_rate: int = 48000,
     language: str | None = None,
+    language_mode: str | None = None,
+    expected_languages: str | None = None,
+    prompt_style: str | None = None,
 ) -> None:
     if not 8000 <= sample_rate <= 96000:
         await websocket.close(code=1008, reason="Unsupported audio sample rate")
         return
-    requested_language = (
-        language if language in TRANSCRIPTION_LANGUAGE_CODES else None
+    if language_mode not in (None, "auto", "expected", "single"):
+        await websocket.close(code=1008, reason="Unsupported language mode")
+        return
+    try:
+        expected_language_codes = (
+            parse_expected_languages(expected_languages)
+            if language_mode == "expected"
+            else None
+        )
+    except ValueError:
+        await websocket.close(code=1008, reason="Invalid expected language list")
+        return
+
+    hinglish_mode = (
+        language_mode == "expected"
+        and expected_language_codes == frozenset({"hi", "en"})
+    )
+    if prompt_style not in (None, "hinglish") or (
+        prompt_style == "hinglish" and not hinglish_mode
+    ):
+        await websocket.close(code=1008, reason="Unsupported transcription prompt style")
+        return
+    if language_mode == "single" and language not in TRANSCRIPTION_LANGUAGE_CODES:
+        await websocket.close(code=1008, reason="Single-language mode requires a language")
+        return
+    if (
+        language_mode == "expected"
+        and language is not None
+        and expected_language_codes is not None
+        and language not in expected_language_codes
+    ):
+        await websocket.close(code=1008, reason="Language is not in the expected set")
+        return
+
+    if language_mode is None:
+        requested_language = (
+            language if language in TRANSCRIPTION_LANGUAGE_CODES else None
+        )
+        language_detection = False
+    elif language_mode == "single":
+        requested_language = language
+        language_detection = False
+    else:
+        requested_language = "hi" if hinglish_mode else None
+        language_detection = True
+    initial_prompt = build_live_initial_prompt(
+        "hinglish" if hinglish_mode else None,
     )
 
     await websocket.accept()
@@ -386,6 +561,10 @@ async def transcribe_live(
     pending_words: list[tuple[float, float, str]] = []
     pending_word_tolerance = 0.08
     detected_language = requested_language
+    language_locked = requested_language is not None
+    active_language = requested_language
+    candidate_language: str | None = None
+    candidate_windows = 0
     chunk_start = 0.0
     last_word_end = 0.0
     resume_received = False
@@ -429,6 +608,7 @@ async def transcribe_live(
                             "type": "transcript",
                             "text": transcript,
                             "segment": " ".join(final_words),
+                            "unconfirmed": "",
                             "language": detected_language,
                         }
                     )
@@ -442,6 +622,7 @@ async def transcribe_live(
                 resume_language = command.get("language")
                 if (
                     not isinstance(resume_text, str)
+                    or len(resume_text) > MAX_TRANSCRIPT_LENGTH
                     or isinstance(resume_at, bool)
                     or not isinstance(resume_at, (int, float))
                     or resume_at < 0
@@ -457,7 +638,7 @@ async def transcribe_live(
                         reason="Invalid live transcription resume state",
                     )
                     return
-                transcript_words = resume_text.split()[-LIVE_PROMPT_CONTEXT_WORDS:]
+                transcript_words = resume_text.split()
                 transcript = " ".join(transcript_words)
                 pending_words = []
                 chunk_start = float(resume_at)
@@ -471,9 +652,14 @@ async def transcribe_live(
                     if chunk_start > 0
                     else 0.0
                 )
-                if resume_language in TRANSCRIPTION_LANGUAGE_CODES:
+                if (
+                    language_mode is None
+                    and resume_language in TRANSCRIPTION_LANGUAGE_CODES
+                ):
                     requested_language = resume_language
                     detected_language = resume_language
+                    language_locked = True
+                    active_language = resume_language
                 resume_received = True
                 continue
             await websocket.close(code=1003, reason="Unsupported command")
@@ -489,18 +675,24 @@ async def transcribe_live(
 
         chunk_seconds = len(pcm) / (2 * sample_rate)
         current_start = chunk_start
-        chunk_start += LIVE_CHUNK_SECONDS - LIVE_OVERLAP_SECONDS
+        chunk_start += max(chunk_seconds - LIVE_OVERLAP_SECONDS, 0.0)
         stable_until = chunk_seconds - LIVE_UNSTABLE_TAIL_SECONDS
         tolerance = min(0.08, chunk_seconds * 0.05)
         pending_word_tolerance = tolerance
 
-        if not any(pcm):
+        if pcm_rms(pcm) < LIVE_SILENCE_RMS:
             try:
                 await websocket.send_json(
                     {
                         "type": "transcript",
                         "text": transcript,
                         "segment": "",
+                        "unconfirmed": build_unconfirmed_text(
+                            pending_words,
+                            last_word_end,
+                            tolerance,
+                            transcript_words,
+                        ),
                         "language": detected_language,
                     }
                 )
@@ -508,15 +700,98 @@ async def transcribe_live(
                 return
             continue
 
-        segment, chunk_language, words = await asyncio.to_thread(
-            transcribe_pcm_chunk,
-            pcm,
-            sample_rate,
-            requested_language,
-            build_live_initial_prompt(transcript),
-        )
-        if chunk_language:
-            detected_language = chunk_language
+        if language_detection:
+            audio, _, _, probabilities = await asyncio.to_thread(
+                detect_pcm_language,
+                pcm,
+                sample_rate,
+            )
+            language_candidate, _ = select_detected_language(
+                probabilities,
+                expected_language_codes,
+            )
+            if language_candidate is None:
+                candidate_language = None
+                candidate_windows = 0
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "transcript",
+                            "text": transcript,
+                            "segment": "",
+                            "unconfirmed": build_unconfirmed_text(
+                                pending_words,
+                                last_word_end,
+                                tolerance,
+                                transcript_words,
+                            ),
+                            "language": detected_language,
+                        }
+                    )
+                except WebSocketDisconnect:
+                    return
+                continue
+
+            if hinglish_mode:
+                transcribe_language = "hi"
+            else:
+                if language_candidate == active_language:
+                    candidate_language = None
+                    candidate_windows = 0
+                elif language_candidate == candidate_language:
+                    candidate_windows += 1
+                else:
+                    candidate_language = language_candidate
+                    candidate_windows = 1
+
+                if candidate_windows >= LIVE_LANGUAGE_CONFIRMATION_WINDOWS:
+                    active_language = language_candidate
+                    requested_language = language_candidate
+                    detected_language = language_candidate
+                    language_locked = True
+                    candidate_language = None
+                    candidate_windows = 0
+
+                if active_language is None:
+                    try:
+                        await websocket.send_json(
+                            {
+                                "type": "transcript",
+                                "text": transcript,
+                                "segment": "",
+                                "unconfirmed": build_unconfirmed_text(
+                                    pending_words,
+                                    last_word_end,
+                                    tolerance,
+                                    transcript_words,
+                                ),
+                                "language": detected_language,
+                            }
+                        )
+                    except WebSocketDisconnect:
+                        return
+                    continue
+                transcribe_language = active_language
+
+            segment, chunk_language, words = await asyncio.to_thread(
+                transcribe_live_audio,
+                audio,
+                transcribe_language,
+                initial_prompt,
+            )
+            if hinglish_mode:
+                detected_language = "hi"
+        else:
+            segment, chunk_language, words = await asyncio.to_thread(
+                transcribe_pcm_chunk,
+                pcm,
+                sample_rate,
+                requested_language,
+                initial_prompt,
+            )
+            if chunk_language and not language_locked:
+                detected_language = chunk_language
+                language_locked = True
 
         if words:
             new_words: list[str] = []
@@ -558,6 +833,12 @@ async def transcribe_live(
                     "type": "transcript",
                     "text": transcript,
                     "segment": segment,
+                    "unconfirmed": build_unconfirmed_text(
+                        pending_words,
+                        last_word_end,
+                        tolerance,
+                        transcript_words,
+                    ),
                     "language": detected_language,
                 }
             )
@@ -573,28 +854,90 @@ async def transcribe_live(
 def transcribe_recording(
     recording_id: UUID,
     language: str | None = None,
+    preserve_edits: bool = False,
+    language_mode: str | None = None,
+    expected_languages: str | None = None,
+    prompt_style: str | None = None,
 ) -> TranscriptionOut:
+    if language_mode not in (None, "auto", "expected", "single"):
+        raise HTTPException(status_code=422, detail="Unsupported language mode")
+    try:
+        expected_language_codes = (
+            parse_expected_languages(expected_languages)
+            if language_mode == "expected"
+            else None
+        )
+    except ValueError as error:
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid expected language list",
+        ) from error
+
+    hinglish_mode = (
+        language_mode == "expected"
+        and expected_language_codes == frozenset({"hi", "en"})
+    )
+    if prompt_style not in (None, "hinglish") or (
+        prompt_style == "hinglish" and not hinglish_mode
+    ):
+        raise HTTPException(status_code=422, detail="Unsupported transcription prompt style")
+    if language_mode == "single" and language not in TRANSCRIPTION_LANGUAGE_CODES:
+        raise HTTPException(
+            status_code=422,
+            detail="Single-language mode requires a language",
+        )
+    if (
+        language_mode == "expected"
+        and language is not None
+        and language not in expected_language_codes
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Language is not in the expected set",
+        )
     if language is not None and language not in TRANSCRIPTION_LANGUAGE_CODES:
         raise HTTPException(status_code=422, detail="Unsupported transcription language")
+    if language_mode == "auto":
+        language = None
+    elif hinglish_mode:
+        language = "hi"
+    allowed_languages = (
+        expected_language_codes
+        if language_mode == "expected" and not hinglish_mode
+        else None
+    )
     audio_path = find_recording(recording_id)
     with RECORDING_METADATA_LOCK:
         if not audio_path.is_file():
             raise HTTPException(status_code=404, detail="Recording not found")
         details = read_recording_metadata(audio_path)
-        if details.get("transcript_reviewed"):
+        if details.get("transcript_reviewed") or preserve_edits:
             return TranscriptionOut(
                 recording_id=str(recording_id),
                 text=details.get("transcript") or "",
                 language=details.get("language"),
-                transcript_reviewed=True,
+                transcript_reviewed=bool(details.get("transcript_reviewed", False)),
             )
         live_transcript = details.get("transcript") or ""
         live_language = details.get("language")
 
-    transcript, detected_language = transcribe_audio_file(
-        audio_path,
-        language=language,
-    )
+    if hinglish_mode:
+        transcript, detected_language = transcribe_audio_file(
+            audio_path,
+            language=language,
+            initial_prompt=LIVE_HINGLISH_PROMPT,
+        )
+    elif allowed_languages is not None:
+        transcript, detected_language = transcribe_audio_file(
+            audio_path,
+            language=language,
+            allowed_languages=allowed_languages,
+        )
+    else:
+        transcript, detected_language = transcribe_audio_file(
+            audio_path,
+            language=language,
+        )
     if live_transcript and (
         not transcript.strip() or has_repeated_phrase_loop(transcript)
     ):
